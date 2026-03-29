@@ -1,42 +1,34 @@
 # Chief of Staff
 
-Status: early public release. The core loop is usable today, while some channels and advanced media features are still more scaffolded than fully productized.
-
-## What is this?
-
 This is a team of agents, led by a Chief of Staff.
 
-- You can communicate with your CoS via Slack *†, Telegram *†, and/or WhatsApp *†. You can also forward emails to them through Gmail intake.
-- You can send them your goals, thoughts, meeting notes, and docs. They can also gather context from Google Drive *, Notion *, Smartsheet *, and OneDrive / O365 *.
-- They collect context from across your work and store it in one place: Google Sheets. That is where they work from.
-- With that information, the Chief of Staff and team propose work, flag drift, and generate updates for you based on your goals and north star.
+- You can communicate with your Chief of Staff via Slack, Telegram, and/or WhatsApp. You can also forward emails to them.
+- You can send them your goals, thoughts, meeting notes, and docs. They can also gather context from Google Drive*, Notion*, Smartsheet*, and OneDrive*.
+- They collects context from across your work, store it in one place (Google Sheets). That's where they work from.
+- With all of these information, the Chief of Staff and their team propose work, flag drift, and generate updates for you — based on your goals and north star.
 
-`*` needs extra setup beyond the core install  
-`†` can add ongoing tool, hosting, or API cost
-
-
-## Your Chief of Staff's Team
+## Your Chief of Staff’s team
 
 Here is the org chart.
 
 ```text
 You
 |
-`-- Chief of Staff
-    |
-    |-- Intelligence & Context
-    |   |-- Intake Lead
-    |   |-- Research Analyst
-    |   `-- Knowledge Manager
-    |
-    |-- Planning & Execution
-    |   |-- Planning Lead
-    |   |-- Delivery Lead
-    |   `-- Program Manager
-    |
-    `-- Communications
-        |-- Briefing Lead
-        `-- Editorial Director
+└─-- Chief of Staff
+   |
+   |-- Intelligence & Context
+   |   |-- Intake Lead
+   |   |-- Research Analyst
+   |   └-- Knowledge Manager
+   |
+   |-- Planning & Execution
+   |   |-- Planning Lead
+   |   |-- Delivery Lead
+   |   └-- Program Manager
+   |
+   └─-- Communications
+       |-- Briefing Lead
+       └─- Editorial Director
 ```
 
 ## Operating Principles
@@ -48,47 +40,21 @@ You
 
 ## Office hours — when does it work?
 
-The CoS team does not continuously watch the Google Sheet in real time.
-
-It works in three ways:
+The CoS team does not continuously watch the Google Sheet in real time. It works:
 
 - on its office-hours schedule, which `setup()` creates for you
-- when you manually run it from Apps Script
+  - `scheduledIntakeLead`: every hour
+  - `scheduledPlanningLead`: every day at 8:00 AM
+  - `scheduledDeliveryMonitor`: every day at 9:00 AM
+  - `scheduledBriefingLead`: every Friday at 4:00 PM
+  - If your team starts later, change the times. What matters most is choosing a rhythm that matches how your team actually works.
 - through instant channel replies once Slack is connected
+- when you manually run it from Apps Script
+  - open your CoS Apps Script project at [script.google.com](http://script.google.com)
+  - choose `officeHoursNow` from the function dropdown at the top \> click `Run`
+  - If you want just one part of the team to work: `intakeNow` `planningNow` `deliveryNow` `briefingNow`
 
-The default office hours are:
-
-- `scheduledIntakeLead`: every hour
-- `scheduledPlanningLead`: every day at 8:00 AM
-- `scheduledDeliveryMonitor`: every day at 9:00 AM
-- `scheduledBriefingLead`: every Friday at 4:00 PM
-
-Think of those times as a starter template, not a rule.
-
-A good mental model is:
-
-- `Intake Lead`: as often as useful updates actually arrive
-- `Planning Lead`: once each morning
-- `Delivery Lead`: once later in the day
-- `Briefing Lead`: once a week
-
-If your team starts later, change the times. What matters most is choosing a rhythm that matches how your team actually works.
-
-If you want the whole team to work right now:
-
-- open [script.google.com](https://script.google.com)
-- open your CoS Apps Script project
-- choose `officeHoursNow` from the function dropdown at the top
-- click `Run`
-
-If you want just one part of the team to work:
-
-- `intakeNow`
-- `planningNow`
-- `deliveryNow`
-- `briefingNow`
-
-## Meet the Team
+## Meet the team
 
 | Role | Responsibility |
 |---|---|
@@ -96,12 +62,14 @@ If you want just one part of the team to work:
 | Planning Lead | Turns information into suggested next steps. |
 | Delivery Lead | Watches for drift or stuck work. |
 | Briefing Lead | Turns the state of the business into readable updates. |
-| Research Analyst | Brings in outside learnings to improve the team's work. |
+| Research Analyst | Brings in outside learnings to improve the team’s work. |
 | Editorial Director | Improves the quality of summaries. |
 | Knowledge Manager | Keeps the context clean and useful. |
 | Program Manager | Watches the task queue and execution flow. |
 
 ### What the team produces and uses
+
+> `*` needs extra setup beyond the core install
 
 | Item | What it is | Type |
 |---|---|---|
@@ -147,8 +115,6 @@ Drift alerts
 Updates
 What needs attention
 ```
-
-## More detail
 
 - [Setup guide](https://www.notion.so/33202f9e5d568163af12f370c152dfff)
 - [How Agents Think](https://www.notion.so/33202f9e5d56819ebc37ebe6210452eb)
