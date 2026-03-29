@@ -19,6 +19,7 @@ const CONFIG_KEYS = {
   NOTION_DATABASE_ID:    'NOTION_DATABASE_ID',
   SMARTSHEET_TOKEN:      'SMARTSHEET_TOKEN',
   SMARTSHEET_SHEET_ID:   'SMARTSHEET_SHEET_ID',
+  SMARTSHEET_TASK_SHEET_ID:'SMARTSHEET_TASK_SHEET_ID',
   ONEDRIVE_TOKEN:        'ONEDRIVE_TOKEN',
   ONEDRIVE_DRIVE_ID:     'ONEDRIVE_DRIVE_ID',
   ONEDRIVE_FOLDER_ID:    'ONEDRIVE_FOLDER_ID',
@@ -32,6 +33,8 @@ const CONFIG_KEYS = {
   WHATSAPP_TOKEN:        'WHATSAPP_TOKEN',
   WHATSAPP_PHONE_NUMBER_ID:'WHATSAPP_PHONE_NUMBER_ID',
   WHATSAPP_ALLOWED_SENDERS:'WHATSAPP_ALLOWED_SENDERS',
+  GOOGLE_WRITEBACK_SPREADSHEET_ID:'GOOGLE_WRITEBACK_SPREADSHEET_ID',
+  GOOGLE_WRITEBACK_SHEET_NAME:'GOOGLE_WRITEBACK_SHEET_NAME',
 };
 
 // Sheet names — change only if you renamed them
@@ -45,6 +48,10 @@ const SHEET = {
   GUIDE:          '📖 Guide',
   KNOWLEDGE_WATCH:'🔍 Knowledge Watch',
   CONTEXT_REVIEW: '🔎 Context Review',
+  TIMELINE:       '📅 Task Timeline',
+  REJECTED_SIGNALS:'🪵 Rejected Signals',
+  PEOPLE:         '👥 Stakeholders',
+  SELF_DRIFT:     '🪞 Self Drift',
 };
 
 const LEGACY_SHEET = {
@@ -74,6 +81,7 @@ const COL = {
   TASK_STATUS:    9,
   CREATED_AT:     10,
   DETAILS:        11,
+  STAKEHOLDER_IDS:12,
 };
 
 // Knowledge Watch columns (1-indexed)
@@ -99,6 +107,11 @@ const TASK_COL = {
   CREATED_AT:     7,
   REVIEWED_AT:    8,
   NOTES:          9,
+  OWNER:          10,
+  OWNER_CHANNEL:  11,
+  DUE_DATE:       12,
+  UPDATED_AT:     13,
+  STAKEHOLDER_IDS:14,
 };
 
 const SLACK_INBOX_HEADERS = [
@@ -140,6 +153,9 @@ function runAll() {
   runEditorialDirector();
   runKnowledgeManager();
   runProgramManager();
+  runSelfDriftCheck();
+  runTaskReminders();
+  refreshTaskTimeline_();
 }
 
 // Human-friendly aliases so non-technical owners do not need to memorize scheduler names.
@@ -180,6 +196,31 @@ function installDefaultOfficeHoursTriggers() {
       .everyWeeks(1)
       .onWeekDay(ScriptApp.WeekDay.FRIDAY)
       .atHour(16)
+      .create();
+  }
+
+  if (!existing.includes('scheduledTaskReminders')) {
+    ScriptApp.newTrigger('scheduledTaskReminders')
+      .timeBased()
+      .everyDays(1)
+      .atHour(10)
+      .create();
+  }
+
+  if (!existing.includes('scheduledTaskTimelineRefresh')) {
+    ScriptApp.newTrigger('scheduledTaskTimelineRefresh')
+      .timeBased()
+      .everyDays(1)
+      .atHour(10)
+      .create();
+  }
+
+  if (!existing.includes('scheduledSelfDriftCheck')) {
+    ScriptApp.newTrigger('scheduledSelfDriftCheck')
+      .timeBased()
+      .everyWeeks(1)
+      .onWeekDay(ScriptApp.WeekDay.MONDAY)
+      .atHour(11)
       .create();
   }
 }
@@ -257,6 +298,10 @@ function scheduledKnowledgeManager() {
 
 function scheduledProgramManager() {
   runProgramManager();
+}
+
+function scheduledSelfDriftCheck() {
+  runSelfDriftCheck();
 }
 
 function processSlackPrompt(prompt, channel, userName) {
@@ -625,6 +670,21 @@ function smartsheetGet_(url, config) {
   return parseJsonResponse_(response, 'Smartsheet');
 }
 
+function smartsheetRequest_(url, config, method, payload) {
+  const response = UrlFetchApp.fetch(url, {
+    method: method || 'post',
+    contentType: 'application/json',
+    headers: {
+      'Authorization': `Bearer ${config.SMARTSHEET_TOKEN}`,
+      'Accept': 'application/json',
+    },
+    payload: JSON.stringify(payload || {}),
+    muteHttpExceptions: true,
+  });
+
+  return parseJsonResponse_(response, 'Smartsheet');
+}
+
 // --- OneDrive connector ---
 
 function fetchOneDriveSignalEvents_(config) {
@@ -703,6 +763,21 @@ function listRecentEmailThreads_(config) {
   });
 }
 
+function rankSignalsForPlanning_(intents, signals) {
+  const intentKeywords = extractKeywords_(intents.map(function(i) { return i.summary + ' ' + (i.details || ''); }).join(' '));
+  const scored = signals.map(function(s) {
+    let score = 0;
+    if (s.confidence === 'High')   score += 3;
+    if (s.confidence === 'Medium') score += 1;
+    if (s.linkedIntent)            score += 4;
+    const sigWords = extractKeywords_(s.summary);
+    intentKeywords.forEach(function(kw) { if (sigWords.indexOf(kw) !== -1) score += 2; });
+    return { signal: s, score: score };
+  });
+  scored.sort(function(a, b) { return b.score - a.score; });
+  return scored;
+}
+
 function buildGmailQuery_(config) {
   const parts = [];
   if (config.GMAIL_QUERY) parts.push(config.GMAIL_QUERY);
@@ -739,10 +814,36 @@ function buildContextRow_(event) {
     '—',               // Task Status
     now,               // Created At
     event.details,     // Details
+    '',                // Stakeholder IDs
   ];
 }
 
+function ensureContextSheetSchema_(sheet) {
+  if (!sheet) return null;
+  const requiredHeaders = [
+    'ID', 'Type', 'Source', 'Summary', 'Confidence', 'Linked Intent', 'Visibility',
+    'Action Ready', 'Task Status', 'Created At', 'Details', 'Stakeholder IDs'
+  ];
+  const currentHeaders = sheet.getRange(1, 1, 1, Math.max(sheet.getLastColumn(), 1)).getValues()[0];
+  let changed = false;
+
+  requiredHeaders.forEach(function(header, index) {
+    if (currentHeaders[index] !== header) {
+      sheet.getRange(1, index + 1).setValue(header);
+      changed = true;
+    }
+  });
+
+  if (changed) {
+    sheet.setColumnWidth(12, 140);
+    sheet.setFrozenRows(1);
+  }
+
+  return sheet;
+}
+
 function appendContextRow_(sheet, row) {
+  ensureContextSheetSchema_(sheet);
   sheet.appendRow(row);
 }
 
@@ -754,6 +855,7 @@ function appendContextRowsIfMissing_(config, rows) {
   if (!sheet) {
     throw new Error('Context Store sheet not found while writing context rows.');
   }
+  ensureContextSheetSchema_(sheet);
 
   const existingIds = getExistingIds_(sheet);
   let added = 0;
@@ -790,11 +892,14 @@ function runPlanningLead() {
   const contextSheet  = ss.getSheetByName(SHEET.CONTEXT);
   const taskSheet     = ss.getSheetByName(SHEET.TASKS);
   const profileSheet  = ss.getSheetByName(SHEET.COMPANY_PROFILE);
+  const peopleSheet   = ss.getSheetByName(SHEET.PEOPLE);
 
   if (!contextSheet || !taskSheet) {
     Logger.log('ERROR: Required sheets not found. Check sheet names.');
     return;
   }
+
+  ensureTaskSheetSchema_(taskSheet);
 
   const contextRows   = readContextStore_(contextSheet);
   const existingTasks = getExistingTaskSummaries_(taskSheet);
@@ -802,6 +907,7 @@ function runPlanningLead() {
   const signals       = extractActionableSignals_(contextRows);
   const constraints   = extractConstraints_(contextRows);
   const profile       = readCompanyProfile_(profileSheet);
+  const stakeholderMap = buildStakeholderMap_(readStakeholderStore_(peopleSheet));
 
   if (intents.length === 0) {
     Logger.log('Planning Lead: no Intent rows found. Add at least one Intent to the Context Store first.');
@@ -822,13 +928,15 @@ function runPlanningLead() {
   }
   PropertiesService.getScriptProperties().setProperty(LAST_RUN_KEY, new Date().toISOString());
 
-  const proposals = generateTaskProposals_(intents, signals, constraints, profile, existingTasks, config);
+  const proposals = generateTaskProposals_(intents, signals, constraints, profile, existingTasks, stakeholderMap, config);
+  const rankedSignals = rankSignalsForPlanning_(intents, signals).slice(0, 10).map(function(item) { return item.signal; });
 
   let added = 0;
   for (const task of proposals) {
     if (!isDuplicate_(task.task, existingTasks)) {
       appendTaskRow_(taskSheet, task);
       existingTasks.add(task.task.toLowerCase().substring(0, 60));
+      syncTaskToWorkspaces_(config, taskSheet, taskSheet.getLastRow());
       added++;
     }
   }
@@ -838,11 +946,14 @@ function runPlanningLead() {
   } else {
     Logger.log('Planning Lead: ' + added + ' new task(s) proposed.');
   }
+
+  logRejectedSignals_(config, rankedSignals, proposals);
 }
 
 // --- Context Store readers ---
 
 function readContextStore_(sheet) {
+  ensureContextSheetSchema_(sheet);
   const data = sheet.getDataRange().getValues();
   const rows = [];
   for (let i = 1; i < data.length; i++) {
@@ -860,9 +971,73 @@ function readContextStore_(sheet) {
       taskStatus:    row[COL.TASK_STATUS - 1],
       createdAt:     row[COL.CREATED_AT - 1],
       details:       row[COL.DETAILS - 1],
+      stakeholderIds:row[COL.STAKEHOLDER_IDS - 1],
     });
   }
   return rows;
+}
+
+function readStakeholderStore_(sheet) {
+  if (!sheet) return [];
+  ensureStakeholdersSheet_(sheet.getParent());
+  const data = sheet.getDataRange().getValues();
+  const rows = [];
+  for (let i = 1; i < data.length; i++) {
+    const row = data[i];
+    if (!row[0]) continue;
+    rows.push({
+      id: String(row[0] || '').trim(),
+      name: String(row[1] || '').trim(),
+      role: String(row[2] || '').trim(),
+      org: String(row[3] || '').trim(),
+      relationship: String(row[4] || '').trim(),
+      preference: String(row[5] || '').trim(),
+      channel: String(row[6] || '').trim(),
+      lastInteraction: String(row[7] || '').trim(),
+      notes: String(row[8] || '').trim(),
+    });
+  }
+  return rows;
+}
+
+function buildStakeholderMap_(rows) {
+  const map = {};
+  (rows || []).forEach(function(row) {
+    if (row.id) map[row.id] = row;
+  });
+  return map;
+}
+
+function collectStakeholderIds_(items) {
+  const seen = {};
+  const ids = [];
+  (items || []).forEach(function(item) {
+    String(item.stakeholderIds || '')
+      .split(',')
+      .map(function(id) { return id.trim(); })
+      .filter(Boolean)
+      .forEach(function(id) {
+        if (!seen[id]) {
+          seen[id] = true;
+          ids.push(id);
+        }
+      });
+  });
+  return ids;
+}
+
+function summarizeStakeholdersForIds_(ids, stakeholderMap) {
+  const uniqueIds = (ids || []).filter(Boolean).slice(0, 6);
+  if (uniqueIds.length === 0) return '(none)';
+  return uniqueIds.map(function(id) {
+    const person = stakeholderMap[id];
+    if (!person) return '- [' + id + ']';
+    const parts = ['- [' + id + '] ' + person.name];
+    if (person.role) parts.push(person.role);
+    if (person.preference) parts.push('Pref: ' + person.preference);
+    if (person.notes) parts.push('Note: ' + person.notes.substring(0, 100));
+    return parts.join(' | ');
+  }).join('\n');
 }
 
 function extractIntents_(rows) {
@@ -893,7 +1068,7 @@ function getExistingTaskSummaries_(sheet) {
 
 // --- Task generation via Claude ---
 
-function generateTaskProposals_(intents, signals, constraints, profile, existingTasks, config) {
+function generateTaskProposals_(intents, signals, constraints, profile, existingTasks, stakeholderMap, config) {
   if (signals.length === 0) {
     Logger.log('No actionable signals found.');
     return [];
@@ -901,18 +1076,7 @@ function generateTaskProposals_(intents, signals, constraints, profile, existing
 
   // Pre-filter: rank signals by keyword overlap with active intents.
   // Explicitly linked signals and High confidence always rank highest.
-  const intentKeywords = extractKeywords_(intents.map(function(i) { return i.summary + ' ' + (i.details || ''); }).join(' '));
-  const scored = signals.map(function(s) {
-    let score = 0;
-    if (s.confidence === 'High')   score += 3;
-    if (s.confidence === 'Medium') score += 1;
-    if (s.linkedIntent)            score += 4;
-    const sigWords = extractKeywords_(s.summary);
-    intentKeywords.forEach(function(kw) { if (sigWords.indexOf(kw) !== -1) score += 2; });
-    return { signal: s, score: score };
-  });
-  scored.sort(function(a, b) { return b.score - a.score; });
-  const topSignals = scored.slice(0, 15).map(function(s) { return s.signal; });
+  const topSignals = rankSignalsForPlanning_(intents, signals).slice(0, 10).map(function(s) { return s.signal; });
 
   // Build intent block with Commander's Intent structure (Purpose, End State, Fallback from Details)
   const intentText = intents.map(function(i) {
@@ -929,8 +1093,9 @@ function generateTaskProposals_(intents, signals, constraints, profile, existing
     : '(none recorded)';
 
   const signalText = topSignals.map(function(s) {
-    return '- [' + s.id + '] (' + s.confidence + ' confidence) ' + s.summary;
+    return '- [' + s.id + '] ' + s.summary.substring(0, 120) + ' (' + s.confidence + ')';
   }).join('\n');
+  const stakeholderText = summarizeStakeholdersForIds_(collectStakeholderIds_(topSignals), stakeholderMap || {});
 
   const existingText = [...existingTasks].slice(0, 15).join('\n- ');
 
@@ -969,8 +1134,11 @@ ${intentText}
 HARD CONSTRAINTS (tasks must never violate these):
 ${constraintText}
 
-SIGNALS (ranked by relevance to active intents — top 15 shown):
+SIGNALS (ranked by relevance to active intents — top 10 shown):
 ${signalText}
+
+RELEVANT STAKEHOLDERS:
+${stakeholderText}
 
 ALREADY PROPOSED (do not duplicate):
 ${existingText || '(none yet)'}
@@ -995,11 +1163,17 @@ Rules:
 - Drop any task where linkedGoal would be DISTRACTION — do not include it
 - Maximum 5 proposals
 - Each task must be executable, not aspirational ("Schedule auth review with CISO" not "Address auth concerns")
+- If a stakeholder preference or relationship note materially affects sequencing or communication, reflect that in the task wording
 - Conservative — both the forward simulation AND the pre-mortem must pass before you propose`;
 
   try {
     // Sonnet: RPD reasoning and structured output require quality inference
-    const response = callClaude_(prompt, config, { model: 'claude-sonnet-4-6', maxTokens: 1200 });
+    const response = callClaude_(prompt, config, {
+      model: 'claude-sonnet-4-6',
+      maxTokens: 900,
+      cacheKey: buildPlanningCacheKey_(intents, topSignals, constraints, existingTasks, profile),
+      cacheTtlSec: 21600,
+    });
     const parsed = JSON.parse(response);
     if (!Array.isArray(parsed)) return [];
     return parsed.slice(0, 5);
@@ -1035,6 +1209,7 @@ function isDuplicate_(task, existingTasks) {
 function appendTaskRow_(sheet, task) {
   const now    = new Date().toISOString();
   const nextId = 'T' + String(sheet.getLastRow()).padStart(3, '0');
+  ensureTaskSheetSchema_(sheet);
   // Notes carries full RPD analysis: situation type, goal link, risks, pre-mortem
   const autoNotes = [
     task.situationType  ? '[' + task.situationType + ']'                        : '',
@@ -1053,6 +1228,10 @@ function appendTaskRow_(sheet, task) {
     now,
     '',
     autoNotes,
+    task.owner || '',
+    task.ownerChannel || '',
+    task.dueDate || '',
+    now,
   ]);
 }
 
@@ -1071,6 +1250,8 @@ function runDeliveryMonitor() {
     Logger.log('ERROR: Proposed Tasks sheet not found.');
     return;
   }
+
+  ensureTaskSheetSchema_(taskSheet);
 
   const data = taskSheet.getDataRange().getValues();
   if (data.length <= 1) {
@@ -1099,6 +1280,8 @@ function runDeliveryMonitor() {
 
     const alert = `[Delivery Lead] Stale for ${ageDays} days - review owner or status.`;
     noteCell.setValue(currentNote ? `${currentNote} | ${alert}` : alert);
+    touchTaskUpdatedAt_(taskSheet, i + 1);
+    syncTaskToWorkspaces_(config, taskSheet, i + 1);
     flagged++;
   }
 
@@ -1120,6 +1303,7 @@ function runBriefingLead() {
   const contextSheet  = ss.getSheetByName(SHEET.CONTEXT);
   const taskSheet     = ss.getSheetByName(SHEET.TASKS);
   const profileSheet  = ss.getSheetByName(SHEET.COMPANY_PROFILE);
+  const peopleSheet   = ss.getSheetByName(SHEET.PEOPLE);
   const briefSheet    = ensureBriefingsSheet_(ss);
 
   if (!contextSheet || !taskSheet || !briefSheet) {
@@ -1127,9 +1311,12 @@ function runBriefingLead() {
     return;
   }
 
+  ensureTaskSheetSchema_(taskSheet);
+
   const contextRows = readContextStore_(contextSheet);
   const taskRows    = readTaskStore_(taskSheet);
   const profile     = readCompanyProfile_(profileSheet);
+  const stakeholderMap = buildStakeholderMap_(readStakeholderStore_(peopleSheet));
   const now         = new Date().toISOString();
 
   // Retain counts as scannable metadata
@@ -1146,13 +1333,13 @@ function runBriefingLead() {
   const prevBriefData = briefSheet.getDataRange().getValues();
   const lastBriefing  = prevBriefData.length > 1 ? prevBriefData[prevBriefData.length - 1] : null;
 
-  const narrative = generateBriefingNarrative_(contextRows, taskRows, profile, lastBriefing, config);
+  const narrative = generateBriefingNarrative_(contextRows, taskRows, profile, stakeholderMap, lastBriefing, config);
 
   briefSheet.appendRow([now, 'Current', contextSummary, taskSummary, narrative, 'Generated by Briefing Lead']);
   Logger.log('Briefing Lead: BLUF briefing appended.');
 }
 
-function generateBriefingNarrative_(contextRows, taskRows, profile, lastBriefing, config) {
+function generateBriefingNarrative_(contextRows, taskRows, profile, stakeholderMap, lastBriefing, config) {
   const nowMs = Date.now();
 
   const intents     = contextRows.filter(function(r) { return r.type === 'Intent'; });
@@ -1165,7 +1352,7 @@ function generateBriefingNarrative_(contextRows, taskRows, profile, lastBriefing
       if (r.type !== 'Signal' && r.type !== 'Learning') return false;
       return (nowMs - new Date(r.createdAt).getTime()) / 86400000 < 7;
     })
-    .slice(0, 10);
+    .slice(0, 6);
 
   const pendingTasks     = taskRows.filter(function(r) { return r.status === 'Pending Review'; });
   const inProgressTasks  = taskRows.filter(function(r) { return r.status === 'In Progress' || r.status === 'Approved'; });
@@ -1187,16 +1374,20 @@ function generateBriefingNarrative_(contextRows, taskRows, profile, lastBriefing
     ? recentSignals.map(function(r) { return '- [' + r.id + '] ' + r.summary + ' (' + r.confidence + ')'; }).join('\n')
     : '(none in last 7 days)';
 
-  const pendingText     = pendingTasks.map(function(t)    { return '- [' + t.id + '] ' + t.task + ' (' + (t.priority || 'n/a') + ' priority)'; }).join('\n') || '(none)';
-  const inProgressText  = inProgressTasks.map(function(t) { return '- [' + t.id + '] ' + t.task; }).join('\n') || '(none)';
+  const pendingText     = pendingTasks.slice(0, 6).map(function(t)    { return '- [' + t.id + '] ' + t.task.substring(0, 100) + ' (' + (t.priority || 'n/a') + ')'; }).join('\n') || '(none)';
+  const inProgressText  = inProgressTasks.slice(0, 6).map(function(t) { return '- [' + t.id + '] ' + t.task.substring(0, 100); }).join('\n') || '(none)';
   const staleText       = staleTasks.map(function(t) {
     const age = Math.floor((nowMs - new Date(t.createdAt).getTime()) / 86400000);
     return '- [' + t.id + '] ' + t.task + ' (' + age + 'd old, ' + t.status + ')';
-  }).join('\n') || '(none)';
+  }).slice(0, 6).join('\n') || '(none)';
 
   const constraintText  = constraints.map(function(c) { return '- ' + c.summary; }).join('\n') || '(none recorded)';
   const prevBriefLine   = lastBriefing ? 'Previous briefing (' + lastBriefing[0] + '): ' + String(lastBriefing[4] || '').substring(0, 200) : '(no previous briefing)';
   const northStar       = profileIsConfigured_(profile) ? buildNorthStarContext_(profile) : '';
+  const stakeholderText = summarizeStakeholdersForIds_(
+    collectStakeholderIds_(recentSignals.concat(pendingTasks).concat(inProgressTasks).concat(staleTasks)),
+    stakeholderMap || {}
+  );
 
   const prompt = `You are Briefing Lead for a Chief of Staff system. Produce an executive intelligence briefing in strict BLUF format. This goes directly to a busy operator — every word must earn its place. No padding. No passive voice.
 
@@ -1234,6 +1425,9 @@ ${staleText}
 CONSTRAINTS:
 ${constraintText}
 
+RELEVANT STAKEHOLDERS:
+${stakeholderText}
+
 ${prevBriefLine}
 
 ---
@@ -1246,7 +1440,12 @@ Rules:
 
   try {
     // Sonnet: briefings are the primary stakeholder-facing output — quality is non-negotiable
-    return callClaude_(prompt, config, { model: 'claude-sonnet-4-6', maxTokens: 700 });
+    return callClaude_(prompt, config, {
+      model: 'claude-sonnet-4-6',
+      maxTokens: 550,
+      cacheKey: buildBriefingCacheKey_(recentSignals, pendingTasks, inProgressTasks, staleTasks, profile, lastBriefing),
+      cacheTtlSec: 3600,
+    });
   } catch (e) {
     return 'BLUF narrative generation failed: ' + e.message.substring(0, 100);
   }
@@ -1329,7 +1528,7 @@ function runResearchAnalyst() {
     appendContextRow_(contextSheet, [
       id, 'Learning', 'Research Analyst', learning.summary,
       'Medium', learning.linkedIntent || '', 'Team', 'No', '—',
-      new Date().toISOString(), learning.details || '',
+      new Date().toISOString(), learning.details || '', '',
     ]);
     existingIds.add(id);
     added++;
@@ -1425,8 +1624,8 @@ function getChildText_(element, tagNames) {
 }
 
 function extractLearningsFromContent_(fetched, config) {
-  const contentBlocks = fetched.map(function(item, i) {
-    return 'SOURCE ' + (i + 1) + ' [' + (item.tags || 'General') + '] — ' + item.source + ':\n' + item.content.substring(0, 1200);
+  const contentBlocks = fetched.slice(0, 4).map(function(item, i) {
+    return 'SOURCE ' + (i + 1) + ' [' + (item.tags || 'General') + '] — ' + item.source + ':\n' + item.content.substring(0, 800);
   }).join('\n\n---\n\n');
 
   const prompt = `You are Research Analyst for a Chief of Staff system. Your role is to keep the owner continuously learning about project management, CoS skills, operations, and leadership — so the system grows more intuitive to their way of working over time.
@@ -1457,7 +1656,12 @@ Rules:
 
   try {
     // Haiku: structured extraction from web text — speed and cost over depth
-    const response = callClaude_(prompt, config, { model: 'claude-haiku-4-5-20251001', maxTokens: 768 });
+    const response = callClaude_(prompt, config, {
+      model: 'claude-haiku-4-5-20251001',
+      maxTokens: 512,
+      cacheKey: buildResearchCacheKey_(fetched),
+      cacheTtlSec: 43200,
+    });
     const parsed = JSON.parse(response);
     if (!Array.isArray(parsed)) return [];
     return parsed.slice(0, 8);
@@ -1549,6 +1753,33 @@ function simpleHash_(str) {
     hash = hash & hash;
   }
   return Math.abs(hash).toString(16).substring(0, 8);
+}
+
+function buildPlanningCacheKey_(intents, topSignals, constraints, existingTasks, profile) {
+  return 'planning:' + simpleHash_([
+    intents.map(function(i) { return i.id + ':' + (i.details || ''); }).join('|'),
+    topSignals.map(function(s) { return s.id + ':' + s.confidence; }).join('|'),
+    constraints.map(function(c) { return c.id + ':' + c.summary; }).join('|'),
+    Array.from(existingTasks).slice(0, 15).join('|'),
+    buildNorthStarContext_(profile),
+  ].join('||'));
+}
+
+function buildBriefingCacheKey_(recentSignals, pendingTasks, inProgressTasks, staleTasks, profile, lastBriefing) {
+  return 'briefing:' + simpleHash_([
+    recentSignals.map(function(r) { return r.id; }).join('|'),
+    pendingTasks.map(function(t) { return t.id + ':' + t.status; }).join('|'),
+    inProgressTasks.map(function(t) { return t.id + ':' + t.status; }).join('|'),
+    staleTasks.map(function(t) { return t.id + ':' + t.status; }).join('|'),
+    buildNorthStarContext_(profile),
+    lastBriefing ? String(lastBriefing[0] || '') : '',
+  ].join('||'));
+}
+
+function buildResearchCacheKey_(fetched) {
+  return 'research:' + simpleHash_(fetched.slice(0, 4).map(function(item) {
+    return item.source + ':' + simpleHash_(item.content || '');
+  }).join('|'));
 }
 
 // ============================================================
@@ -1814,6 +2045,8 @@ function runProgramManager() {
     return;
   }
 
+  ensureTaskSheetSchema_(taskSheet);
+
   const data = taskSheet.getDataRange().getValues();
   if (data.length <= 1) {
     Logger.log('Program Manager: No tasks to review.');
@@ -1862,6 +2095,8 @@ function runProgramManager() {
     const current  = String(data[item.rowNum - 1][TASK_COL.NOTES - 1] || '');
     const note     = '[Program Manager] Quick win — small effort, high priority. Action today.';
     noteCell.setValue(current ? current + ' | ' + note : note);
+    touchTaskUpdatedAt_(taskSheet, item.rowNum);
+    syncTaskToWorkspaces_(config, taskSheet, item.rowNum);
   });
 
   stalePending.forEach(function(item) {
@@ -1869,6 +2104,8 @@ function runProgramManager() {
     const current  = String(data[item.rowNum - 1][TASK_COL.NOTES - 1] || '');
     const note     = '[Program Manager] Stale ' + item.ageDays + 'd in review — approve, reject, or reassign.';
     noteCell.setValue(current ? current + ' | ' + note : note);
+    touchTaskUpdatedAt_(taskSheet, item.rowNum);
+    syncTaskToWorkspaces_(config, taskSheet, item.rowNum);
   });
 
   drifting.forEach(function(item) {
@@ -1876,6 +2113,8 @@ function runProgramManager() {
     const current  = String(data[item.rowNum - 1][TASK_COL.NOTES - 1] || '');
     const note     = '[Program Manager] Drift — in progress ' + item.ageDays + 'd. Check for blockers or reassign.';
     noteCell.setValue(current ? current + ' | ' + note : note);
+    touchTaskUpdatedAt_(taskSheet, item.rowNum);
+    syncTaskToWorkspaces_(config, taskSheet, item.rowNum);
   });
 
   // Only call Claude if there is something worth summarising — skip the API call on clean days
@@ -1915,6 +2154,231 @@ Write one sharp sentence (max 160 chars) naming the single most important action
   } catch (e) {
     return 'Program Manager digest unavailable: ' + e.message.substring(0, 60);
   }
+}
+
+function ensureRejectedSignalsSheet_(ss) {
+  let sheet = ss.getSheetByName(SHEET.REJECTED_SIGNALS);
+  if (sheet) return sheet;
+
+  sheet = ss.insertSheet(SHEET.REJECTED_SIGNALS);
+  sheet.appendRow(['Logged At', 'Signal ID', 'Summary', 'Confidence', 'Reason', 'Next Review', 'Notes']);
+  sheet.setFrozenRows(1);
+  return sheet;
+}
+
+function logRejectedSignals_(config, rankedSignals, proposals) {
+  if (!rankedSignals || rankedSignals.length === 0) return;
+
+  const ss = SpreadsheetApp.openById(config.SPREADSHEET_ID);
+  const sheet = ensureRejectedSignalsSheet_(ss);
+  const existingKeys = new Set();
+  const data = sheet.getDataRange().getValues();
+  for (let i = 1; i < data.length; i++) {
+    existingKeys.add(String(data[i][1] || '') + '|' + String(data[i][4] || ''));
+  }
+
+  const usedContextIds = {};
+  (proposals || []).forEach(function(task) {
+    String(task.contextIds || '').split(',').map(function(id) { return id.trim(); }).filter(Boolean).forEach(function(id) {
+      usedContextIds[id] = true;
+    });
+  });
+
+  const rejectedSignals = rankedSignals.filter(function(signal) {
+    return !usedContextIds[signal.id];
+  }).slice(0, 5);
+  const reasonMap = buildRejectedSignalReasonMap_(rejectedSignals, proposals || [], config);
+  const baseReason = proposals && proposals.length > 0
+    ? 'Lower priority than selected work this run.'
+    : 'No proposal survived simulation/pre-mortem this run.';
+  const nextReview = Utilities.formatDate(new Date(Date.now() + (7 * 86400000)), Session.getScriptTimeZone(), 'yyyy-MM-dd');
+
+  rejectedSignals.forEach(function(signal) {
+    const reason = reasonMap[signal.id] || inferRejectedSignalReasonHeuristically_(signal, proposals || []) || baseReason;
+    const key = String(signal.id || '') + '|' + reason;
+    if (existingKeys.has(key)) return;
+    sheet.appendRow([
+      new Date().toISOString(),
+      signal.id || '',
+      signal.summary || '',
+      signal.confidence || '',
+      reason,
+      nextReview,
+      signal.linkedIntent ? 'Linked intent: ' + signal.linkedIntent : '',
+    ]);
+    existingKeys.add(key);
+  });
+}
+
+function buildRejectedSignalReasonMap_(rejectedSignals, proposals, config) {
+  if (!rejectedSignals || rejectedSignals.length === 0) return {};
+
+  const prompt = `You are Planning Lead quality control.
+
+SELECTED TASKS:
+${proposals.map(function(task) {
+  return '- ' + (task.task || '') + ' | Priority: ' + (task.priority || '') + ' | Context IDs: ' + (task.contextIds || '');
+}).join('\n') || '(none)'}
+
+REJECTED SIGNALS TO CLASSIFY:
+${rejectedSignals.map(function(signal) {
+  return '- [' + signal.id + '] ' + signal.summary + ' | Confidence: ' + signal.confidence + ' | Intent: ' + (signal.linkedIntent || 'none');
+}).join('\n')}
+
+For each rejected signal, give the most likely "not now" reason. Use one of:
+- Waiting for more evidence
+- Lower priority than selected work
+- Already covered by another task
+- Not clearly tied to an active goal
+- Constraint or anti-goal conflict
+- Needs a decision first
+- Useful later, not urgent now
+
+Return JSON only:
+{
+  "items": [
+    { "id": "signal id", "reason": "one of the allowed reasons above" }
+  ]
+}`;
+
+  try {
+    const response = callClaude_(prompt, config, {
+      model: 'claude-haiku-4-5-20251001',
+      maxTokens: 220,
+      cacheKey: 'rejected-reasons:' + simpleHash_(prompt),
+      cacheTtlSec: 21600,
+    });
+    const parsed = parseClaudeJsonObject_(response);
+    const map = {};
+    if (!parsed || !Array.isArray(parsed.items)) return map;
+    parsed.items.forEach(function(item) {
+      const id = String(item.id || '').trim();
+      const reason = String(item.reason || '').trim();
+      if (id && reason) map[id] = reason;
+    });
+    return map;
+  } catch (e) {
+    Logger.log('Rejected signal reason classification failed: ' + e.message);
+    return {};
+  }
+}
+
+function inferRejectedSignalReasonHeuristically_(signal, proposals) {
+  if (signal.confidence === 'Low') return 'Waiting for more evidence';
+  if (!signal.linkedIntent) return 'Not clearly tied to an active goal';
+
+  const overlaps = proposals.some(function(task) {
+    return String(task.contextIds || '').indexOf(signal.id) !== -1;
+  });
+  if (overlaps) return 'Already covered by another task';
+
+  if (signal.confidence === 'Medium') return 'Useful later, not urgent now';
+  return 'Lower priority than selected work';
+}
+
+function runSelfDriftCheck() {
+  Logger.log('=== Self Drift Check started ===');
+  const config = validateConfig_(['SPREADSHEET_ID', 'ANTHROPIC_KEY']);
+  const ss = SpreadsheetApp.openById(config.SPREADSHEET_ID);
+  const taskSheet = ss.getSheetByName(SHEET.TASKS);
+  const contextSheet = ss.getSheetByName(SHEET.CONTEXT);
+  const profileSheet = ss.getSheetByName(SHEET.COMPANY_PROFILE);
+  const driftSheet = ensureSelfDriftSheet_(ss);
+
+  if (!taskSheet || !contextSheet) {
+    Logger.log('Self Drift Check: required sheets not found.');
+    return;
+  }
+
+  const profile = readCompanyProfile_(profileSheet);
+  if (!profileIsConfigured_(profile)) {
+    Logger.log('Self Drift Check: company profile not configured.');
+    return;
+  }
+
+  const taskRows = readTaskStore_(taskSheet);
+  const contextRows = readContextStore_(contextSheet);
+  const recentTasks = taskRows.filter(function(task) {
+    const updated = normalizeDateInput_(task.updatedAt || task.createdAt);
+    if (!updated) return false;
+    return (Date.now() - new Date(updated + 'T00:00:00').getTime()) / 86400000 <= 7;
+  }).slice(0, 10);
+  const recentSignals = contextRows.filter(function(row) {
+    if (row.type !== 'Signal' && row.type !== 'Decision') return false;
+    return (Date.now() - new Date(row.createdAt).getTime()) / 86400000 <= 7;
+  }).slice(0, 8);
+
+  if (recentTasks.length === 0 && recentSignals.length === 0) {
+    Logger.log('Self Drift Check: nothing recent enough to review.');
+    return;
+  }
+
+  const prompt = `You are Self Drift Auditor for a Chief of Staff system.
+
+NORTH STAR:
+${buildNorthStarContext_(profile)}
+
+RECENT TASK ACTIVITY:
+${recentTasks.map(function(task) {
+  return '- [' + task.id + '] ' + task.status + ' | ' + task.task.substring(0, 120) + ' | Owner: ' + (task.owner || 'n/a');
+}).join('\n') || '(none)'}
+
+RECENT SIGNALS / DECISIONS:
+${recentSignals.map(function(row) {
+  return '- [' + row.id + '] ' + row.type + ' | ' + row.summary.substring(0, 120);
+}).join('\n') || '(none)'}
+
+Return JSON only:
+{
+  "alignmentStatus": "Aligned | Watch | Drift",
+  "driftSignals": "max 220 chars",
+  "correction": "max 220 chars"
+}
+
+Rules:
+- Judge whether recent activity appears aligned to active goals and anti-goals
+- Be specific, not generic
+- If aligned, say why briefly
+- If drifting, name the pattern and the corrective move`;
+
+  try {
+    const response = callClaude_(prompt, config, {
+      model: 'claude-haiku-4-5-20251001',
+      maxTokens: 220,
+      cacheKey: buildSelfDriftCacheKey_(profile, recentTasks, recentSignals),
+      cacheTtlSec: 21600,
+    });
+    const parsed = parseClaudeJsonObject_(response) || {};
+    driftSheet.appendRow([
+      new Date().toISOString(),
+      'Last 7 days',
+      String(parsed.alignmentStatus || 'Watch'),
+      String(parsed.driftSignals || ''),
+      String(parsed.correction || ''),
+      '',
+    ]);
+    Logger.log('Self Drift Check: audit appended.');
+  } catch (e) {
+    Logger.log('Self Drift Check failed: ' + e.message);
+  }
+}
+
+function ensureSelfDriftSheet_(ss) {
+  let sheet = ss.getSheetByName(SHEET.SELF_DRIFT);
+  if (sheet) return sheet;
+
+  sheet = ss.insertSheet(SHEET.SELF_DRIFT);
+  sheet.appendRow(['Reviewed At', 'Window', 'Alignment Status', 'Drift Signals', 'Correction', 'Notes']);
+  sheet.setFrozenRows(1);
+  return sheet;
+}
+
+function buildSelfDriftCacheKey_(profile, tasks, signals) {
+  return 'selfdrift:' + simpleHash_([
+    buildNorthStarContext_(profile),
+    tasks.map(function(task) { return task.id + ':' + task.status + ':' + task.updatedAt; }).join('|'),
+    signals.map(function(row) { return row.id + ':' + row.createdAt; }).join('|'),
+  ].join('||'));
 }
 
 // ============================================================
@@ -1999,6 +2463,15 @@ function handleChannelMessageRelay_(payload, config, metadata) {
 }
 
 function processChannelConversation_(config, metadata, prompt, artifactRows) {
+  const commandOutcome = handleTaskCommand_(config, metadata, prompt);
+  if (commandOutcome && commandOutcome.handled) {
+    return {
+      reply: commandOutcome.reply,
+      importantCount: 0,
+      rowsAdded: 0,
+    };
+  }
+
   const reply = generateChiefOfStaffReply_(prompt, config, {
     platform: metadata.platform,
     source: metadata.source,
@@ -2035,16 +2508,28 @@ function generateChiefOfStaffReply_(prompt, config, metadata) {
   const ss = SpreadsheetApp.openById(config.SPREADSHEET_ID);
   const contextSheet = ss.getSheetByName(SHEET.CONTEXT);
   const taskSheet = ss.getSheetByName(SHEET.TASKS);
+  const peopleSheet = ss.getSheetByName(SHEET.PEOPLE);
 
   if (!contextSheet || !taskSheet) {
     throw new Error('Required sheets not found for Slack response generation.');
   }
 
+  ensureTaskSheetSchema_(taskSheet);
+
   const contextRows    = readContextStore_(contextSheet);
   const taskRows       = readTaskStore_(taskSheet);
+  const stakeholderMap = buildStakeholderMap_(readStakeholderStore_(peopleSheet));
   // Pass the user's message so context is filtered by relevance, not just recency
   const contextSummary = buildContextSummaryForChat_(contextRows, prompt);
   const taskSummary    = buildTaskSummaryForChat_(taskRows, prompt);
+  const relevantStakeholders = summarizeStakeholdersForIds_(
+    collectStakeholderIds_(contextRows.concat(taskRows).filter(function(item) {
+      const text = String(item.summary || item.task || '').toLowerCase();
+      const query = String(prompt || '').toLowerCase();
+      return !query || text.indexOf(query.split(/\s+/)[0] || '') !== -1;
+    }).slice(0, 8)),
+    stakeholderMap
+  );
 
   const conversationContext = [
     `Source: ${metadata.source || 'Slack'}`,
@@ -2069,6 +2554,9 @@ ${contextSummary}
 CURRENT TASK SNAPSHOT:
 ${taskSummary}
 
+RELEVANT STAKEHOLDERS:
+${relevantStakeholders}
+
 USER MESSAGE:
 ${prompt}
 
@@ -2076,27 +2564,6 @@ Return plain text only. Keep it concise but useful for Slack.`;
 
   // Sonnet: conversational replies are user-facing — quality matters here
   return callClaude_(agentPrompt, config, { model: 'claude-sonnet-4-6', maxTokens: 768 });
-}
-
-function readTaskStore_(sheet) {
-  const data = sheet.getDataRange().getValues();
-  const rows = [];
-  for (let i = 1; i < data.length; i++) {
-    const row = data[i];
-    if (!row[TASK_COL.ID - 1]) continue;
-    rows.push({
-      id: row[TASK_COL.ID - 1],
-      task: row[TASK_COL.TASK - 1],
-      contextIds: row[TASK_COL.CONTEXT_IDS - 1],
-      priority: row[TASK_COL.PRIORITY - 1],
-      effort: row[TASK_COL.EFFORT - 1],
-      status: row[TASK_COL.STATUS - 1],
-      createdAt: row[TASK_COL.CREATED_AT - 1],
-      reviewedAt: row[TASK_COL.REVIEWED_AT - 1],
-      notes: row[TASK_COL.NOTES - 1],
-    });
-  }
-  return rows;
 }
 
 // Scores context rows by keyword overlap with the user's message.
@@ -2128,31 +2595,8 @@ function buildContextSummaryForChat_(rows, userMessage) {
 
   const selected = intents.concat(rest);
   return selected.map(function(row) {
-    return '- [' + row.id + '] ' + row.type + ' | ' + row.summary + ' | ' + (row.confidence || 'n/a') + ' | Intent: ' + (row.linkedIntent || 'none');
-  }).join('\n');
-}
-
-function buildTaskSummaryForChat_(rows, userMessage) {
-  if (rows.length === 0) return '(no tasks yet)';
-
-  const queryWords = userMessage ? extractKeywords_(userMessage) : [];
-  const active     = rows.filter(function(r) { return r.status !== 'Done' && r.status !== 'Rejected'; });
-
-  const scored = active.map(function(r) {
-    let score = 0;
-    if (queryWords.length > 0) {
-      const taskWords = extractKeywords_(r.task);
-      queryWords.forEach(function(w) { if (taskWords.indexOf(w) !== -1) score++; });
-    }
-    if (r.priority === 'High')            score += 2;
-    if (r.status === 'In Progress')       score += 1;
-    if (r.status === 'Pending Review')    score += 1;
-    return { row: r, score: score };
-  });
-  scored.sort(function(a, b) { return b.score - a.score; });
-
-  return scored.slice(0, 8).map(function(s) { // top 8 relevant (was last-10 by recency)
-    return '- [' + s.row.id + '] ' + s.row.status + ' | ' + s.row.task + ' | ' + (s.row.priority || 'n/a');
+    const stakeholders = row.stakeholderIds ? ' | Stakeholders: ' + row.stakeholderIds : '';
+    return '- [' + row.id + '] ' + row.type + ' | ' + row.summary + ' | ' + (row.confidence || 'n/a') + ' | Intent: ' + (row.linkedIntent || 'none') + stakeholders;
   }).join('\n');
 }
 
@@ -2355,6 +2799,7 @@ function buildChannelContextRow_(item) {
     '—',
     now,
     item.details,
+    item.stakeholderIds || '',
   ];
 }
 
@@ -2417,6 +2862,10 @@ function normalizeConfidence_(value) {
 }
 
 function extractImportantContextFromConversation_(prompt, reply, metadata, config) {
+  if (shouldSkipContextExtraction_(prompt)) {
+    return { summary: '', items: [] };
+  }
+
   const analysisPrompt = `You are Intake Lead for a Chief of Staff system.
 
 Decide whether the user's message contains IMPORTANT CONTEXT that should be promoted into the shared context store.
@@ -2462,7 +2911,7 @@ Rules:
 - Quote only the most important phrase, not the whole message`;
 
   try {
-    const response = callClaude_(analysisPrompt, config, { model: 'claude-haiku-4-5-20251001', maxTokens: 700 });
+    const response = callClaude_(analysisPrompt, config, { model: 'claude-haiku-4-5-20251001', maxTokens: 420 });
     const parsed = parseClaudeJsonObject_(response);
     if (!parsed || !Array.isArray(parsed.items)) {
       return { summary: '', items: [] };
@@ -2520,6 +2969,21 @@ function buildFallbackImportantContext_(prompt) {
   }
 
   return { summary: '', items: [] };
+}
+
+function shouldSkipContextExtraction_(prompt) {
+  const text = String(prompt || '').trim();
+  if (!text) return true;
+  if (text.length > 180) return false;
+
+  const lower = text.toLowerCase();
+  const importantHints = ['decided', 'decision', 'must', 'cannot', 'blocked', 'risk', 'priority', 'goal', 'intent', 'deadline', 'due', 'ship', 'launch'];
+  for (let i = 0; i < importantHints.length; i++) {
+    if (lower.indexOf(importantHints[i]) !== -1) return false;
+  }
+
+  const lowSignal = ['thanks', 'got it', 'sounds good', 'ok', 'okay', 'yes', 'no', 'cool'];
+  return lowSignal.indexOf(lower) !== -1 || text.length < 24;
 }
 
 function buildFallbackConversationSummary_(prompt, metadata) {
@@ -2724,6 +3188,13 @@ function ensureBriefingsSheet_(ss) {
 function callClaude_(prompt, config, options) {
   const model     = (options && options.model)     || 'claude-haiku-4-5-20251001';
   const maxTokens = (options && options.maxTokens) || 512;
+  const cacheKey  = (options && options.cacheKey)  || '';
+  const cacheTtl  = (options && options.cacheTtlSec) || 0;
+
+  if (cacheKey && cacheTtl > 0) {
+    const cached = getPromptCache_(cacheKey, cacheTtl);
+    if (cached) return cached;
+  }
 
   const payload = {
     model: model,
@@ -2750,7 +3221,36 @@ function callClaude_(prompt, config, options) {
   }
 
   const data = JSON.parse(body);
-  return data.content[0].text;
+  const text = data.content[0].text;
+
+  if (cacheKey && cacheTtl > 0) {
+    setPromptCache_(cacheKey, text);
+  }
+
+  return text;
+}
+
+function getPromptCache_(key, ttlSec) {
+  const props = PropertiesService.getScriptProperties();
+  const raw = props.getProperty('PROMPT_CACHE_' + key);
+  if (!raw) return '';
+
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed.savedAt || !parsed.text) return '';
+    if ((Date.now() - new Date(parsed.savedAt).getTime()) / 1000 > ttlSec) return '';
+    return parsed.text;
+  } catch (e) {
+    return '';
+  }
+}
+
+function setPromptCache_(key, text) {
+  const props = PropertiesService.getScriptProperties();
+  props.setProperty('PROMPT_CACHE_' + key, JSON.stringify({
+    savedAt: new Date().toISOString(),
+    text: text,
+  }));
 }
 
 function parseClaudeJsonObject_(text) {
@@ -2809,6 +3309,7 @@ function showSetupChecklist() {
   Logger.log(`Drive folder ID: ${props.DRIVE_FOLDER_ID || '(optional)'}`);
   Logger.log(`Notion token: ${props.NOTION_TOKEN ? 'set' : '(optional)'}`);
   Logger.log(`Smartsheet token: ${props.SMARTSHEET_TOKEN ? 'set' : '(optional)'}`);
+  Logger.log(`Smartsheet task sheet ID: ${props.SMARTSHEET_TASK_SHEET_ID || '(optional)'}`);
   Logger.log(`OneDrive token: ${props.ONEDRIVE_TOKEN ? 'set' : '(optional)'}`);
   Logger.log(`Gmail label: ${props.GMAIL_LABEL || '(optional)'}`);
   Logger.log(`Gmail query: ${props.GMAIL_QUERY || '(optional)'}`);
@@ -2820,6 +3321,8 @@ function showSetupChecklist() {
   Logger.log(`WhatsApp token: ${props.WHATSAPP_TOKEN ? 'set' : '(optional)'}`);
   Logger.log(`WhatsApp phone number ID: ${props.WHATSAPP_PHONE_NUMBER_ID || '(optional)'}`);
   Logger.log(`WhatsApp allowed senders: ${props.WHATSAPP_ALLOWED_SENDERS || '(optional)'}`);
+  Logger.log(`Google write-back spreadsheet: ${props.GOOGLE_WRITEBACK_SPREADSHEET_ID || '(optional)'}`);
+  Logger.log(`Google write-back sheet name: ${props.GOOGLE_WRITEBACK_SHEET_NAME || '(optional)'}`);
 
   if (missing.length === 0) {
     Logger.log('All required script properties are configured.');
@@ -2930,6 +3433,8 @@ function refreshSetupDashboard() {
   const optionalRows = []
     .concat(sourceRows)
     .concat([
+      buildFeatureRow_('Google task write-back', !!config.GOOGLE_WRITEBACK_SPREADSHEET_ID, 'Later', 'Script properties: GOOGLE_WRITEBACK_SPREADSHEET_ID + optional GOOGLE_WRITEBACK_SHEET_NAME'),
+      buildFeatureRow_('Smartsheet task write-back', !!config.SMARTSHEET_TASK_SHEET_ID && !!config.SMARTSHEET_TOKEN, 'Later', 'Script properties: SMARTSHEET_TASK_SHEET_ID + SMARTSHEET_TOKEN'),
       buildFeatureRow_('Slack channel', slackEnabled, 'Recommended first channel when ready', 'Slack relay + SLACK_BOT_TOKEN + SLACK_RELAY_SECRET'),
       buildFeatureRow_('Telegram channel', telegramEnabled, 'Later', 'Relay deployment + TELEGRAM_BOT_TOKEN'),
       buildFeatureRow_('WhatsApp channel', whatsappEnabled, 'Later', 'Relay deployment + WHATSAPP_TOKEN + WHATSAPP_PHONE_NUMBER_ID'),
@@ -2992,6 +3497,9 @@ function getSetupTriggerStatuses_() {
     'scheduledPlanningLead',
     'scheduledDeliveryMonitor',
     'scheduledBriefingLead',
+    'scheduledTaskReminders',
+    'scheduledTaskTimelineRefresh',
+    'scheduledSelfDriftCheck',
   ];
 
   const installed = ScriptApp.getProjectTriggers()
@@ -3032,6 +3540,7 @@ function setFrameworkConfig() {
     NOTION_DATABASE_ID:  '',
     SMARTSHEET_TOKEN:    '',
     SMARTSHEET_SHEET_ID: '',
+    SMARTSHEET_TASK_SHEET_ID: '',
     ONEDRIVE_TOKEN:      '',
     ONEDRIVE_DRIVE_ID:   '',
     ONEDRIVE_FOLDER_ID:  '',
@@ -3045,6 +3554,8 @@ function setFrameworkConfig() {
     WHATSAPP_TOKEN:      '',
     WHATSAPP_PHONE_NUMBER_ID: '',
     WHATSAPP_ALLOWED_SENDERS: '',
+    GOOGLE_WRITEBACK_SPREADSHEET_ID: '',
+    GOOGLE_WRITEBACK_SHEET_NAME: 'Chief of Staff Tasks',
   });
 
   Logger.log('Template values saved to Script properties.');
@@ -3067,6 +3578,7 @@ function getConfig_() {
     NOTION_DATABASE_ID:    props[CONFIG_KEYS.NOTION_DATABASE_ID] || '',
     SMARTSHEET_TOKEN:      props[CONFIG_KEYS.SMARTSHEET_TOKEN] || '',
     SMARTSHEET_SHEET_ID:   props[CONFIG_KEYS.SMARTSHEET_SHEET_ID] || '',
+    SMARTSHEET_TASK_SHEET_ID: props[CONFIG_KEYS.SMARTSHEET_TASK_SHEET_ID] || '',
     ONEDRIVE_TOKEN:        props[CONFIG_KEYS.ONEDRIVE_TOKEN] || '',
     ONEDRIVE_DRIVE_ID:     props[CONFIG_KEYS.ONEDRIVE_DRIVE_ID] || '',
     ONEDRIVE_FOLDER_ID:    props[CONFIG_KEYS.ONEDRIVE_FOLDER_ID] || '',
@@ -3080,6 +3592,8 @@ function getConfig_() {
     WHATSAPP_TOKEN:        props[CONFIG_KEYS.WHATSAPP_TOKEN] || '',
     WHATSAPP_PHONE_NUMBER_ID: props[CONFIG_KEYS.WHATSAPP_PHONE_NUMBER_ID] || '',
     WHATSAPP_ALLOWED_SENDERS: props[CONFIG_KEYS.WHATSAPP_ALLOWED_SENDERS] || '',
+    GOOGLE_WRITEBACK_SPREADSHEET_ID: props[CONFIG_KEYS.GOOGLE_WRITEBACK_SPREADSHEET_ID] || '',
+    GOOGLE_WRITEBACK_SHEET_NAME: props[CONFIG_KEYS.GOOGLE_WRITEBACK_SHEET_NAME] || 'Chief of Staff Tasks',
   };
 }
 
@@ -3163,4 +3677,6 @@ function jsonResponse_(payload) {
 //   scheduledEditorialDirector -> Time-driven -> Week timer  -> Friday 5pm (after Briefing Lead)
 //   scheduledKnowledgeManager  -> Time-driven -> Week timer  -> Monday 8am
 //   scheduledProgramManager    -> Time-driven -> Day timer   -> 8:30am
+//   scheduledTaskReminders     -> Time-driven -> Day timer   -> 10am
+//   scheduledTaskTimelineRefresh -> Time-driven -> Day timer -> 10am
 // ============================================================

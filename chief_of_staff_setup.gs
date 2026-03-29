@@ -21,11 +21,15 @@ function setup() {
   buildCompanyProfileTab_(ss);  // first — north star everything else depends on
   buildContextStoreTab_(ss);
   buildProposedTasksTab_(ss);
+  buildTaskTimelineTab_(ss);
+  buildRejectedSignalsTab_(ss);
+  buildPeopleTab_(ss);
   buildBriefingsTab_(ss);
   buildIntakeLogTab_(ss);
   buildSetupDashboardTab_(ss);
   buildKnowledgeWatchTab_(ss);
   buildContextReviewTab_(ss);
+  buildSelfDriftTab_(ss);
   buildGuideTab_(ss);
 
   // Remove the default blank Sheet1 if it still exists
@@ -106,7 +110,7 @@ function buildContextStoreTab_(ss) {
   const headers = [
     'ID', 'Type', 'Source', 'Summary',
     'Confidence', 'Linked Intent', 'Visibility',
-    'Action Ready', 'Task Status', 'Created At', 'Details'
+    'Action Ready', 'Task Status', 'Created At', 'Details', 'Stakeholder IDs'
   ];
   sheet.appendRow(headers);
 
@@ -129,6 +133,7 @@ function buildContextStoreTab_(ss) {
   sheet.setColumnWidth(9, 120);   // Task Status
   sheet.setColumnWidth(10, 170);  // Created At
   sheet.setColumnWidth(11, 300);  // Details
+  sheet.setColumnWidth(12, 140);  // Stakeholder IDs
 
   // Freeze header row
   sheet.setFrozenRows(1);
@@ -143,12 +148,12 @@ function buildContextStoreTab_(ss) {
   // Sample rows
   const now = new Date().toISOString();
   const samples = [
-    ['INT-001', 'Intent',      'Manual',  'Ship auth v2 before Q2',                           'High',   '',       'Team',        'No',  '—',          now, 'Purpose: Unblock enterprise deal requiring SSO | End State: Auth v2 in production, enterprise customer onboarded | Fallback: Ship magic links only if full v2 slips past March'],
-    ['INT-002', 'Intent',      'Manual',  'Reduce delivery error rate below 2%',              'High',   '',       'Team',        'No',  '—',          now, 'Purpose: Error rate at 5.5% is causing customer churn | End State: Error rate <2% sustained for 2 weeks | Fallback: Isolate top 3 error sources and patch those if full fix takes >3 weeks'],
-    ['DEC-001', 'Decision',    'Manual',  'Use magic links instead of password auth',         'High',   'INT-001','Team',        'No',  '—',          now, 'Decided in design review 2026-03-20'],
-    ['SIG-001', 'Signal',      'GitHub',  'PR #42: Add magic link token generation',          'High',   'INT-001','Team',        'Yes', 'Proposed',   now, 'Merged. Ready for review stage.'],
-    ['CON-001', 'Constraint',  'Manual',  'No external API calls from auth flow',             'High',   'INT-001','Team',        'No',  '—',          now, 'Security requirement from CISO'],
-    ['LEA-001', 'Learning',    'Manual',  'Token expiry of 15min causes drop-off in testing', 'Medium', 'INT-001','Team',        'No',  '—',          now, 'Observed in QA session 2026-03-22'],
+    ['INT-001', 'Intent',      'Manual',  'Ship auth v2 before Q2',                           'High',   '',       'Team',        'No',  '—',          now, 'Purpose: Unblock enterprise deal requiring SSO | End State: Auth v2 in production, enterprise customer onboarded | Fallback: Ship magic links only if full v2 slips past March', ''],
+    ['INT-002', 'Intent',      'Manual',  'Reduce delivery error rate below 2%',              'High',   '',       'Team',        'No',  '—',          now, 'Purpose: Error rate at 5.5% is causing customer churn | End State: Error rate <2% sustained for 2 weeks | Fallback: Isolate top 3 error sources and patch those if full fix takes >3 weeks', ''],
+    ['DEC-001', 'Decision',    'Manual',  'Use magic links instead of password auth',         'High',   'INT-001','Team',        'No',  '—',          now, 'Decided in design review 2026-03-20', ''],
+    ['SIG-001', 'Signal',      'GitHub',  'PR #42: Add magic link token generation',          'High',   'INT-001','Team',        'Yes', 'Proposed',   now, 'Merged. Ready for review stage.', ''],
+    ['CON-001', 'Constraint',  'Manual',  'No external API calls from auth flow',             'High',   'INT-001','Team',        'No',  '—',          now, 'Security requirement from CISO', ''],
+    ['LEA-001', 'Learning',    'Manual',  'Token expiry of 15min causes drop-off in testing', 'Medium', 'INT-001','Team',        'No',  '—',          now, 'Observed in QA session 2026-03-22', ''],
   ];
 
   for (const row of samples) {
@@ -175,7 +180,8 @@ function buildProposedTasksTab_(ss) {
   const headers = [
     'ID', 'Task', 'Supporting Context IDs',
     'Priority', 'Effort', 'Status',
-    'Created At', 'Reviewed At', 'Notes'
+    'Created At', 'Reviewed At', 'Notes',
+    'Owner', 'Owner Channel', 'Due Date', 'Updated At', 'Stakeholder IDs'
   ];
   sheet.appendRow(headers);
 
@@ -196,6 +202,11 @@ function buildProposedTasksTab_(ss) {
   sheet.setColumnWidth(7, 170);   // Created At
   sheet.setColumnWidth(8, 170);   // Reviewed At
   sheet.setColumnWidth(9, 220);   // Notes
+  sheet.setColumnWidth(10, 140);  // Owner
+  sheet.setColumnWidth(11, 180);  // Owner Channel
+  sheet.setColumnWidth(12, 120);  // Due Date
+  sheet.setColumnWidth(13, 170);  // Updated At
+  sheet.setColumnWidth(14, 140);  // Stakeholder IDs
 
   sheet.setFrozenRows(1);
 
@@ -207,9 +218,9 @@ function buildProposedTasksTab_(ss) {
   // Sample tasks
   const now = new Date().toISOString();
   const samples = [
-    ['T001', 'Review magic link token generation PR #42 and approve for staging', 'SIG-001, DEC-001', 'High',   'Small',  'Pending Review', now, '', 'Linked to INT-001'],
-    ['T002', 'Update token expiry from 15min to 30min based on QA findings',      'LEA-001, CON-001', 'Medium', 'Small',  'Pending Review', now, '', 'Check with CISO first'],
-    ['T003', 'Write integration test suite for magic link flow end-to-end',        'SIG-001, INT-001', 'High',   'Medium', 'Pending Review', now, '', ''],
+    ['T001', 'Review magic link token generation PR #42 and approve for staging', 'SIG-001, DEC-001', 'High',   'Small',  'Pending Review', now, '', 'Linked to INT-001', 'Chief of Staff', '', '', now, ''],
+    ['T002', 'Update token expiry from 15min to 30min based on QA findings',      'LEA-001, CON-001', 'Medium', 'Small',  'Pending Review', now, '', 'Check with CISO first', '', '', '', now, ''],
+    ['T003', 'Write integration test suite for magic link flow end-to-end',        'SIG-001, INT-001', 'High',   'Medium', 'Pending Review', now, '', '', '', '', '', now, ''],
   ];
 
   for (const row of samples) {
@@ -226,7 +237,87 @@ function buildProposedTasksTab_(ss) {
 }
 
 // ============================================================
-// TAB 3 — Briefings
+// TAB 3 — Task Timeline
+// ============================================================
+
+function buildTaskTimelineTab_(ss) {
+  const sheet = ss.insertSheet('📅 Task Timeline');
+  const headers = ['ID', 'Task', 'Owner', 'Status', 'Priority', 'Start', 'Due', 'Duration'];
+
+  sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+  sheet.getRange(1, 1, 1, headers.length)
+    .setBackground('#12324a')
+    .setFontColor('#ffffff')
+    .setFontWeight('bold');
+
+  sheet.setColumnWidth(1, 80);
+  sheet.setColumnWidth(2, 320);
+  sheet.setColumnWidth(3, 140);
+  sheet.setColumnWidth(4, 110);
+  sheet.setColumnWidth(5, 90);
+  sheet.setColumnWidth(6, 90);
+  sheet.setColumnWidth(7, 90);
+  sheet.setColumnWidth(8, 70);
+  sheet.setFrozenRows(1);
+  sheet.setFrozenColumns(8);
+  sheet.getRange(2, 1).setValue('Run runAll() or refreshTaskTimeline_() after tasks exist.');
+}
+
+// ============================================================
+// TAB 4 — Rejected Signals
+// ============================================================
+
+function buildRejectedSignalsTab_(ss) {
+  const sheet = ss.insertSheet('🪵 Rejected Signals');
+  const headers = ['Logged At', 'Signal ID', 'Summary', 'Confidence', 'Reason', 'Next Review', 'Notes'];
+  sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+  sheet.getRange(1, 1, 1, headers.length)
+    .setBackground('#4a2b1f')
+    .setFontColor('#ffffff')
+    .setFontWeight('bold');
+
+  sheet.setColumnWidth(1, 170);
+  sheet.setColumnWidth(2, 110);
+  sheet.setColumnWidth(3, 340);
+  sheet.setColumnWidth(4, 100);
+  sheet.setColumnWidth(5, 280);
+  sheet.setColumnWidth(6, 110);
+  sheet.setColumnWidth(7, 220);
+  sheet.setFrozenRows(1);
+  sheet.getRange(2, 1).setValue('Planning Lead records signals considered but not turned into tasks here, with a specific "not now" reason.');
+}
+
+// ============================================================
+// TAB 5 — Stakeholders
+// ============================================================
+
+function buildPeopleTab_(ss) {
+  const sheet = ss.insertSheet('👥 Stakeholders');
+  const headers = ['Stakeholder ID', 'Name', 'Role', 'Org', 'Relationship', 'Communication Preference', 'Channel', 'Last Interaction', 'Notes'];
+  sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+  sheet.getRange(1, 1, 1, headers.length)
+    .setBackground('#264653')
+    .setFontColor('#ffffff')
+    .setFontWeight('bold');
+
+  sheet.setColumnWidth(1, 110);
+  sheet.setColumnWidth(2, 180);
+  sheet.setColumnWidth(3, 180);
+  sheet.setColumnWidth(4, 160);
+  sheet.setColumnWidth(5, 180);
+  sheet.setColumnWidth(6, 200);
+  sheet.setColumnWidth(7, 160);
+  sheet.setColumnWidth(8, 170);
+  sheet.setColumnWidth(9, 320);
+  sheet.setFrozenRows(1);
+  sheet.getRange(2, 1, 2, headers.length).setValues([
+    ['STK-001', 'Jane Example', 'Head of Product', 'Acme', 'Key partner', 'Brief async updates first', 'slack:C012345', '', 'Replace with real stakeholder context'],
+    ['STK-002', 'Alex Example', 'Customer champion', 'Design Partner', 'External stakeholder', 'Email summary after milestones', 'email:alex@example.com', '', ''],
+  ]);
+}
+
+// ============================================================
+// TAB 6 — Briefings
 // ============================================================
 
 function buildBriefingsTab_(ss) {
@@ -418,6 +509,27 @@ function buildGuideTab_(ss) {
     ['In Progress',    'Being worked on.'],
     ['Done',           'Complete.'],
     ['Rejected',       'You chose not to do this. Kept for audit trail.'],
+    ['', ''],
+    ['── TASK COMMANDS ──', ''],
+    ['Create task',    'In Slack / Telegram / WhatsApp, send: "create task Draft Q2 board update". It creates an approved task assigned to Chief of Staff by default.'],
+    ['Create doc',     'Send: "create doc for T004". Chief of Staff creates a Google Doc scaffold for that task and stores the doc link in the task notes.'],
+    ['Update doc',     'Send: "update doc T004 with Add customer rollout checklist and owners." Chief of Staff appends that update to the linked Google Doc.'],
+    ['Assign owner',   'Send: "assign T004 to me" or "assign T004 to Chief of Staff" or "assign T004 to Sarah via slack:C012345".'],
+    ['Set due date',   'Send: "set T004 due 2026-04-02". Use YYYY-MM-DD to avoid ambiguity.'],
+    ['Update status',  'Send: "status T004 In Progress" or "mark T004 done".'],
+    ['Add note',       'Send: "note T004 Waiting on legal review".'],
+    ['Task reminders', 'Tasks with an Owner Channel and Due Date can send reminders on the daily reminder schedule. Owner Channel format: slack:CHANNEL_ID, telegram:CHAT_ID, whatsapp:PHONE_OR_CHAT_ID.'],
+    ['Task timeline',  'The 📅 Task Timeline tab renders a lightweight Gantt-style schedule from task status, created date, effort, and due date. Send "refresh timeline" or run refreshTaskTimeline_() after major task edits.'],
+    ['Workspace sync', 'Optional write-back: set GOOGLE_WRITEBACK_SPREADSHEET_ID to mirror tasks into a Google Sheet, and/or SMARTSHEET_TASK_SHEET_ID to upsert tasks into Smartsheet. Send "sync T004" to force a sync for one task.'],
+    ['Confirm action', 'High-priority Chief of Staff tasks require explicit confirmation before doc creation, sync, or execution. Send: "confirm T004".'],
+    ['Remember person', 'Send: "remember person Jane Doe | Head of Product | Acme | prefers concise async updates | slack:C012345".'],
+    ['Link stakeholder', 'Send: "link T004 to Jane Doe" or "link T004 to STK-001" to create an explicit relationship between a task and a stakeholder.'],
+    ['Link context', 'Send: "link context SIG-001 to Jane Doe" or "link context DEC-001 to STK-001" to connect stakeholder memory directly to context rows.'],
+    ['', ''],
+    ['── MEMORY & DRIFT ──', ''],
+    ['Rejected Signals', 'The 🪵 Rejected Signals tab stores signals Planning Lead considered but did not turn into tasks, so "not now" context is not lost.'],
+    ['Stakeholders',    'The 👥 Stakeholders tab stores relationship context, communication preferences, and last-touch notes for important people.'],
+    ['Self Drift',      'The 🪞 Self Drift tab checks whether recent activity appears aligned to your stated north star and surfaces correction advice.'],
     ['', ''],
     ['── COMPANY PROFILE (NORTH STAR) ──', ''],
     ['What it is',           'The single source of truth for why you exist, what you\'re building, and what you\'ve decided not to do. Every agent uses it to filter distractions and flag drift.'],
@@ -625,6 +737,29 @@ function buildContextReviewTab_(ss) {
   sheet.setColumnWidth(7, 420);
   sheet.setColumnWidth(8, 200);
   sheet.setFrozenRows(1);
+}
+
+// ============================================================
+// TAB 9 — Self Drift
+// ============================================================
+
+function buildSelfDriftTab_(ss) {
+  const sheet = ss.insertSheet('🪞 Self Drift');
+  const headers = ['Reviewed At', 'Window', 'Alignment Status', 'Drift Signals', 'Correction', 'Notes'];
+  sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+  sheet.getRange(1, 1, 1, headers.length)
+    .setBackground('#5a3d5c')
+    .setFontColor('#ffffff')
+    .setFontWeight('bold');
+
+  sheet.setColumnWidth(1, 170);
+  sheet.setColumnWidth(2, 120);
+  sheet.setColumnWidth(3, 130);
+  sheet.setColumnWidth(4, 360);
+  sheet.setColumnWidth(5, 360);
+  sheet.setColumnWidth(6, 220);
+  sheet.setFrozenRows(1);
+  sheet.getRange(2, 1).setValue('Run runSelfDriftCheck() after tasks and north star are set.');
 }
 
 // ============================================================
