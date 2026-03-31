@@ -1,6 +1,6 @@
 // ============================================================
 // CHIEF OF STAFF — Task Runtime
-// Task schema, task commands, reminders, and timeline view.
+// Task schema, task commands, reminders, and Gantt deck refresh.
 // ============================================================
 
 function scheduledTaskReminders() {
@@ -250,10 +250,10 @@ function handleTaskCommand_(config, metadata, prompt) {
 
   match = text.match(/^refresh timeline$/i) || text.match(/^timeline refresh$/i);
   if (match) {
-    refreshTaskTimeline_();
+    const deck = refreshTaskTimeline_();
     return {
       handled: true,
-      reply: 'Task timeline refreshed.',
+      reply: deck && deck.url ? 'Gantt deck refreshed: ' + deck.url : 'Gantt deck refreshed.',
     };
   }
 
@@ -315,7 +315,9 @@ function readTaskStore_(sheet) {
       notes: row[TASK_COL.NOTES - 1],
       owner: row[TASK_COL.OWNER - 1],
       ownerChannel: row[TASK_COL.OWNER_CHANNEL - 1],
+      startDate: row[TASK_COL.START_DATE - 1],
       dueDate: row[TASK_COL.DUE_DATE - 1],
+      blockedBy: row[TASK_COL.BLOCKED_BY - 1],
       updatedAt: row[TASK_COL.UPDATED_AT - 1],
       stakeholderIds: row[TASK_COL.STAKEHOLDER_IDS - 1],
     });
@@ -355,39 +357,68 @@ function ensureTaskSheetSchema_(sheet) {
 
   const requiredHeaders = [
     'ID', 'Task', 'Supporting Context IDs', 'Priority', 'Effort', 'Status',
-    'Created At', 'Reviewed At', 'Notes', 'Owner', 'Owner Channel', 'Due Date', 'Updated At', 'Stakeholder IDs'
+    'Created At', 'Reviewed At', 'Notes', 'Owner', 'Owner Channel', 'Start Date', 'Due Date', 'Blocked By', 'Updated At', 'Stakeholder IDs'
   ];
 
-  const currentHeaders = sheet.getRange(1, 1, 1, Math.max(sheet.getLastColumn(), 1)).getValues()[0];
-  let changed = false;
+  const lastRow = Math.max(sheet.getLastRow(), 1);
+  const lastColumn = Math.max(sheet.getLastColumn(), 1);
+  const data = sheet.getRange(1, 1, lastRow, lastColumn).getValues();
+  const currentHeaders = data[0] || [];
+  const currentSignature = currentHeaders.slice(0, requiredHeaders.length).join('|');
+  const requiredSignature = requiredHeaders.join('|');
 
-  requiredHeaders.forEach(function(header, index) {
-    const col = index + 1;
-    if (currentHeaders[index] !== header) {
-      sheet.getRange(1, col).setValue(header);
-      changed = true;
+  if (currentSignature !== requiredSignature) {
+    const headerIndex = {};
+    currentHeaders.forEach(function(header, index) {
+      headerIndex[String(header || '').trim()] = index;
+    });
+
+    const migratedRows = [];
+    for (let rowIndex = 1; rowIndex < data.length; rowIndex++) {
+      const row = data[rowIndex];
+      if (!row[0]) continue;
+      migratedRows.push([
+        row[headerIndex['ID']] || '',
+        row[headerIndex['Task']] || '',
+        row[headerIndex['Supporting Context IDs']] || '',
+        row[headerIndex['Priority']] || '',
+        row[headerIndex['Effort']] || '',
+        row[headerIndex['Status']] || '',
+        row[headerIndex['Created At']] || '',
+        row[headerIndex['Reviewed At']] || '',
+        row[headerIndex['Notes']] || '',
+        row[headerIndex['Owner']] || '',
+        row[headerIndex['Owner Channel']] || '',
+        row[headerIndex['Start Date']] || '',
+        row[headerIndex['Due Date']] || '',
+        row[headerIndex['Blocked By']] || '',
+        row[headerIndex['Updated At']] || '',
+        row[headerIndex['Stakeholder IDs']] || '',
+      ]);
     }
-  });
 
-  if (sheet.getLastColumn() < requiredHeaders.length) {
-    changed = true;
+    sheet.clearContents();
+    sheet.getRange(1, 1, 1, requiredHeaders.length).setValues([requiredHeaders]);
+    if (migratedRows.length > 0) {
+      sheet.getRange(2, 1, migratedRows.length, requiredHeaders.length).setValues(migratedRows);
+    }
   }
 
-  if (changed) {
-    sheet.setFrozenRows(1);
-    sheet.setColumnWidth(10, 140);
-    sheet.setColumnWidth(11, 180);
-    sheet.setColumnWidth(12, 120);
-    sheet.setColumnWidth(13, 170);
-    sheet.setColumnWidth(14, 140);
-    try {
-      const statusRule = SpreadsheetApp.newDataValidation()
-        .requireValueInList(['Pending Review', 'Approved', 'In Progress', 'Done', 'Rejected'], true)
-        .build();
-      sheet.getRange(2, TASK_COL.STATUS, Math.max(sheet.getMaxRows() - 1, 1), 1).setDataValidation(statusRule);
-    } catch (e) {
-      // Existing spreadsheets may not allow large-range validation updates during every run.
-    }
+  sheet.setFrozenRows(1);
+  sheet.setColumnWidth(10, 140);
+  sheet.setColumnWidth(11, 180);
+  sheet.setColumnWidth(12, 120);
+  sheet.setColumnWidth(13, 120);
+  sheet.setColumnWidth(14, 120);
+  sheet.setColumnWidth(15, 170);
+  sheet.setColumnWidth(16, 140);
+  try {
+    const statusRule = SpreadsheetApp.newDataValidation()
+      .requireValueInList(['Pending Review', 'Approved', 'In Progress', 'Done', 'Rejected'], true)
+      .build();
+    sheet.getRange(2, TASK_COL.STATUS, Math.max(sheet.getMaxRows() - 1, 1), 1).setDataValidation(statusRule);
+  } catch (e) {
+    // Existing spreadsheets may not allow large-range validation updates during every run.
   }
 
   return sheet;
@@ -471,12 +502,14 @@ function describeTaskRow_(row) {
   if (!row) return 'Task not found.';
   const owner = String(row[TASK_COL.OWNER - 1] || '').trim() || 'Unassigned';
   const due = formatTaskDueDate_(row[TASK_COL.DUE_DATE - 1]);
+  const start = normalizeDateInput_(row[TASK_COL.START_DATE - 1]);
   const status = String(row[TASK_COL.STATUS - 1] || '').trim() || 'Unknown';
   const stakeholders = String(row[TASK_COL.STAKEHOLDER_IDS - 1] || '').trim();
   return [
     '[' + row[TASK_COL.ID - 1] + '] ' + row[TASK_COL.TASK - 1],
     'Status: ' + status,
     'Owner: ' + owner,
+    start ? 'Start: ' + start : '',
     'Due: ' + due,
     stakeholders ? 'Stakeholders: ' + stakeholders : '',
   ].join(' | ');
@@ -509,7 +542,9 @@ function createManualTask_(sheet, text, metadata) {
     metadata && metadata.notes ? metadata.notes : '',
     metadata && metadata.owner ? metadata.owner : '',
     ownerChannel,
+    metadata && metadata.startDate ? metadata.startDate : '',
     metadata && metadata.dueDate ? metadata.dueDate : '',
+    metadata && metadata.blockedBy ? metadata.blockedBy : '',
     now,
     metadata && metadata.stakeholderIds ? metadata.stakeholderIds : '',
   ]);
@@ -550,7 +585,9 @@ function taskRowToObject_(row) {
     notes: row[TASK_COL.NOTES - 1],
     owner: row[TASK_COL.OWNER - 1],
     ownerChannel: row[TASK_COL.OWNER_CHANNEL - 1],
+    startDate: row[TASK_COL.START_DATE - 1],
     dueDate: row[TASK_COL.DUE_DATE - 1],
+    blockedBy: row[TASK_COL.BLOCKED_BY - 1],
     updatedAt: row[TASK_COL.UPDATED_AT - 1],
     stakeholderIds: row[TASK_COL.STAKEHOLDER_IDS - 1],
   };
@@ -583,7 +620,7 @@ function syncTaskToGoogleWriteback_(config, taskSheet, rowNum) {
     targetSheet = targetSs.insertSheet(sheetName);
   }
 
-  const headers = ['Task ID', 'Task', 'Owner', 'Status', 'Priority', 'Effort', 'Due Date', 'Updated At', 'Context IDs', 'Stakeholder IDs', 'Notes', 'Doc URL'];
+  const headers = ['Task ID', 'Task', 'Owner', 'Status', 'Priority', 'Effort', 'Start Date', 'Due Date', 'Blocked By', 'Updated At', 'Context IDs', 'Stakeholder IDs', 'Notes', 'Doc URL'];
   const currentHeaders = targetSheet.getRange(1, 1, 1, Math.max(targetSheet.getLastColumn(), 1)).getValues()[0];
   if (currentHeaders[0] !== headers[0]) {
     targetSheet.getRange(1, 1, 1, headers.length).setValues([headers]);
@@ -607,7 +644,9 @@ function syncTaskToGoogleWriteback_(config, taskSheet, rowNum) {
     task.status || '',
     task.priority || '',
     task.effort || '',
+    normalizeDateInput_(task.startDate),
     formatTaskDueDate_(task.dueDate),
+    task.blockedBy || '',
     task.updatedAt || task.createdAt || '',
     task.contextIds || '',
     task.stakeholderIds || '',
@@ -897,90 +936,21 @@ function sendMessageToOwnerChannel_(config, ownerChannel, text) {
   return false;
 }
 
-function ensureTaskTimelineSheet_(ss) {
-  let sheet = ss.getSheetByName(SHEET.TIMELINE);
-  if (sheet) return sheet;
-
-  sheet = ss.insertSheet(SHEET.TIMELINE);
-  sheet.setFrozenRows(1);
-  sheet.setFrozenColumns(8);
-  return sheet;
-}
-
 function refreshTaskTimeline_() {
   const config = validateConfig_(['SPREADSHEET_ID']);
   const ss = SpreadsheetApp.openById(config.SPREADSHEET_ID);
   const taskSheet = ss.getSheetByName(SHEET.TASKS);
-  if (!taskSheet) return;
+  if (!taskSheet) return null;
 
   ensureTaskSheetSchema_(taskSheet);
-  const timelineSheet = ensureTaskTimelineSheet_(ss);
   const taskRows = readTaskStore_(taskSheet)
     .filter(function(task) { return task.status !== 'Rejected'; })
     .sort(function(a, b) { return taskSortValue_(a) - taskSortValue_(b); });
-
-  timelineSheet.clear();
-
-  const baseHeaders = ['ID', 'Task', 'Owner', 'Status', 'Priority', 'Start', 'Due', 'Duration'];
-  const today = new Date();
-  const start = new Date(today.getFullYear(), today.getMonth(), today.getDate() - 3);
-  const days = 21;
-  const dateHeaders = [];
-  for (let i = 0; i < days; i++) {
-    const d = new Date(start.getFullYear(), start.getMonth(), start.getDate() + i);
-    dateHeaders.push(Utilities.formatDate(d, Session.getScriptTimeZone(), 'MM-dd'));
-  }
-
-  timelineSheet.getRange(1, 1, 1, baseHeaders.length + dateHeaders.length)
-    .setValues([baseHeaders.concat(dateHeaders)]);
-  timelineSheet.getRange(1, 1, 1, baseHeaders.length + dateHeaders.length)
-    .setBackground('#0d1b2a')
-    .setFontColor('#ffffff')
-    .setFontWeight('bold');
-
-  if (taskRows.length === 0) {
-    timelineSheet.getRange(2, 1).setValue('No tasks yet.');
-    return;
-  }
-
-  const values = [];
-  taskRows.forEach(function(task) {
-    const window = calculateTaskWindow_(task);
-    values.push([
-      task.id,
-      task.task,
-      task.owner || '',
-      task.status || '',
-      task.priority || '',
-      window.startLabel,
-      window.endLabel,
-      window.durationDays,
-    ].concat(new Array(days).fill('')));
-  });
-
-  timelineSheet.getRange(2, 1, values.length, values[0].length).setValues(values);
-  timelineSheet.setColumnWidth(1, 80);
-  timelineSheet.setColumnWidth(2, 320);
-  timelineSheet.setColumnWidth(3, 140);
-  timelineSheet.setColumnWidth(4, 110);
-  timelineSheet.setColumnWidth(5, 90);
-  timelineSheet.setColumnWidth(6, 90);
-  timelineSheet.setColumnWidth(7, 90);
-  timelineSheet.setColumnWidth(8, 70);
-  for (let c = 9; c < 9 + days; c++) {
-    timelineSheet.setColumnWidth(c, 36);
-  }
-
-  taskRows.forEach(function(task, index) {
-    paintTaskTimelineBar_(timelineSheet, index + 2, task, start, days);
-  });
-
-  timelineSheet.setFrozenRows(1);
-  timelineSheet.setFrozenColumns(8);
+  return refreshGanttDeck_(config, ss, taskRows);
 }
 
 function calculateTaskWindow_(task) {
-  const created = normalizeDateInput_(task.createdAt) || Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd');
+  const created = normalizeDateInput_(task.startDate) || normalizeDateInput_(task.createdAt) || Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd');
   const due = normalizeDateInput_(task.dueDate);
   const durationDays = task.effort === 'Large' ? 10 : task.effort === 'Medium' ? 5 : 2;
   const startLabel = created;
@@ -999,33 +969,142 @@ function calculateTaskWindow_(task) {
   };
 }
 
-function paintTaskTimelineBar_(sheet, rowNum, task, rangeStart, days) {
-  const window = calculateTaskWindow_(task);
-  const taskStart = new Date(window.startLabel + 'T00:00:00');
-  const taskEnd = new Date(window.endLabel + 'T00:00:00');
-  const rowRange = sheet.getRange(rowNum, 9, 1, days);
-  const backgrounds = [];
-  const values = [];
-  const fill = task.status === 'Done' ? '#9ae6b4'
-    : task.status === 'In Progress' ? '#63b3ed'
-    : task.status === 'Approved' ? '#f6e05e'
-    : '#cbd5e0';
-
-  for (let i = 0; i < days; i++) {
-    const date = new Date(rangeStart.getFullYear(), rangeStart.getMonth(), rangeStart.getDate() + i);
-    const inRange = date.getTime() >= taskStart.getTime() && date.getTime() <= taskEnd.getTime();
-    backgrounds.push(inRange ? fill : '#ffffff');
-    values.push(inRange ? '■' : '');
-  }
-
-  rowRange.setBackgrounds([backgrounds]);
-  rowRange.setValues([values]);
-  rowRange.setHorizontalAlignment('center');
-}
-
 function taskSortValue_(task) {
   const due = normalizeDateInput_(task.dueDate);
   if (due) return new Date(due + 'T00:00:00').getTime();
   const created = normalizeDateInput_(task.createdAt);
   return created ? new Date(created + 'T00:00:00').getTime() : Number.MAX_SAFE_INTEGER;
+}
+
+function refreshGanttDeck_(config, ss, taskRows) {
+  const deck = getOrCreateGanttDeck_(config, ss);
+  const presentation = SlidesApp.openById(deck.id);
+  const slides = presentation.getSlides();
+  if (slides.length === 0) {
+    presentation.appendSlide(SlidesApp.PredefinedLayout.BLANK);
+  }
+
+  while (presentation.getSlides().length > 1) {
+    presentation.getSlides()[presentation.getSlides().length - 1].remove();
+  }
+
+  const titleSlide = presentation.getSlides()[0];
+  clearSlide_(titleSlide);
+  renderGanttTitleSlide_(titleSlide, ss, taskRows);
+
+  const activeTasks = taskRows.filter(function(task) {
+    return task.status !== 'Done' && task.status !== 'Rejected';
+  });
+
+  if (activeTasks.length === 0) {
+    titleSlide.insertTextBox('No active tasks to display.', 40, 120, 300, 30)
+      .getText().getTextStyle().setFontSize(18);
+  } else {
+    const chunkSize = 8;
+    for (let i = 0; i < activeTasks.length; i += chunkSize) {
+      const slide = i === 0 ? presentation.appendSlide(SlidesApp.PredefinedLayout.BLANK) : presentation.appendSlide(SlidesApp.PredefinedLayout.BLANK);
+      renderGanttTimelineSlide_(slide, activeTasks.slice(i, i + chunkSize), i / chunkSize + 1);
+    }
+  }
+
+  return deck;
+}
+
+function getOrCreateGanttDeck_(config, ss) {
+  let deckId = String(config.GANTT_SLIDES_ID || '').trim();
+  if (deckId) {
+    try {
+      const file = DriveApp.getFileById(deckId);
+      return { id: deckId, url: file.getUrl() };
+    } catch (e) {
+      deckId = '';
+    }
+  }
+
+  const deck = SlidesApp.create('Chief of Staff - Gantt Timeline');
+  deckId = deck.getId();
+  saveFrameworkConfig_({ GANTT_SLIDES_ID: deckId });
+  try {
+    DriveApp.getFileById(deckId).addEditor(Session.getEffectiveUser().getEmail());
+  } catch (e) {
+    // Best effort only.
+  }
+  refreshSetupDashboard();
+  return { id: deckId, url: deck.getUrl() };
+}
+
+function clearSlide_(slide) {
+  slide.getPageElements().forEach(function(element) {
+    element.remove();
+  });
+}
+
+function renderGanttTitleSlide_(slide, ss, taskRows) {
+  const title = slide.insertTextBox('Chief of Staff Gantt', 32, 24, 420, 40);
+  title.getText().getTextStyle().setFontSize(26).setBold(true);
+
+  const subtitle = [
+    'Source of truth: ' + ss.getUrl(),
+    'Last refreshed: ' + new Date().toISOString(),
+    'Tasks shown: ' + taskRows.filter(function(task) { return task.status !== 'Rejected'; }).length,
+  ].join('\n');
+  slide.insertTextBox(subtitle, 32, 76, 520, 54).getText().getTextStyle().setFontSize(12);
+
+  slide.insertTextBox('Status colors: Pending Review = gray | Approved = yellow | In Progress = blue | Done = green | Blocked = red', 32, 330, 600, 24)
+    .getText().getTextStyle().setFontSize(10);
+}
+
+function renderGanttTimelineSlide_(slide, tasks, pageNumber) {
+  clearSlide_(slide);
+  slide.insertTextBox('Gantt Timeline', 20, 12, 240, 24).getText().getTextStyle().setFontSize(20).setBold(true);
+  slide.insertTextBox('Page ' + pageNumber, 620, 14, 60, 20).getText().getTextStyle().setFontSize(10);
+
+  const today = new Date();
+  const rangeStart = new Date(today.getFullYear(), today.getMonth(), today.getDate() - 3);
+  const days = 21;
+  const chartLeft = 280;
+  const chartTop = 54;
+  const chartWidth = 400;
+  const dayWidth = chartWidth / days;
+  const rowHeight = 34;
+
+  for (let i = 0; i < days; i++) {
+    const date = new Date(rangeStart.getFullYear(), rangeStart.getMonth(), rangeStart.getDate() + i);
+    const label = Utilities.formatDate(date, Session.getScriptTimeZone(), 'MM-dd');
+    slide.insertTextBox(label, chartLeft + (i * dayWidth), chartTop, dayWidth, 14)
+      .getText().getTextStyle().setFontSize(8);
+  }
+
+  tasks.forEach(function(task, index) {
+    const y = chartTop + 20 + (index * rowHeight);
+    const window = calculateTaskWindow_(task);
+    const startDate = new Date(window.startLabel + 'T00:00:00');
+    const endDate = new Date(window.endLabel + 'T00:00:00');
+    const offsetDays = Math.max(0, Math.floor((startDate.getTime() - rangeStart.getTime()) / 86400000));
+    const spanDays = Math.max(1, Math.floor((endDate.getTime() - startDate.getTime()) / 86400000) + 1);
+    const barLeft = chartLeft + Math.min(days - 1, offsetDays) * dayWidth;
+    const barWidth = Math.min(days - offsetDays, spanDays) * dayWidth;
+
+    slide.insertTextBox('[' + task.id + '] ' + truncateTaskLabel_(task.task, 42), 20, y, 250, 16)
+      .getText().getTextStyle().setFontSize(10);
+    slide.insertTextBox((task.owner || 'Unassigned') + ' | ' + (task.status || 'Unknown'), 20, y + 14, 250, 14)
+      .getText().getTextStyle().setFontSize(8);
+
+    const bar = slide.insertShape(SlidesApp.ShapeType.RECTANGLE, barLeft, y + 6, Math.max(barWidth, 6), 12);
+    bar.getFill().setSolidFill(colorForTaskStatus_(task.status));
+  });
+}
+
+function colorForTaskStatus_(status) {
+  if (status === 'Done') return '#9AE6B4';
+  if (status === 'In Progress') return '#63B3ED';
+  if (status === 'Approved') return '#F6E05E';
+  if (status === 'Blocked') return '#FC8181';
+  return '#CBD5E0';
+}
+
+function truncateTaskLabel_(text, maxLen) {
+  const value = String(text || '').trim();
+  if (value.length <= maxLen) return value;
+  return value.substring(0, Math.max(0, maxLen - 1)).trim() + '…';
 }

@@ -35,30 +35,34 @@ const CONFIG_KEYS = {
   WHATSAPP_ALLOWED_SENDERS:'WHATSAPP_ALLOWED_SENDERS',
   GOOGLE_WRITEBACK_SPREADSHEET_ID:'GOOGLE_WRITEBACK_SPREADSHEET_ID',
   GOOGLE_WRITEBACK_SHEET_NAME:'GOOGLE_WRITEBACK_SHEET_NAME',
+  BRIEFING_DELIVERY_CHANNELS:'BRIEFING_DELIVERY_CHANNELS',
+  GANTT_SLIDES_ID:'GANTT_SLIDES_ID',
 };
 
-// Sheet names — change only if you renamed them
+// Primary sheet names for the current product shape.
 const SHEET = {
-  COMPANY_PROFILE:'🎯 Company Profile',
+  COMPANY_PROFILE:'🎯 Goals',
   CONTEXT:        '📥 Context Store',
   TASKS:          '⚡ Proposed Tasks',
   BRIEFINGS:      '📝 Briefings',
   SLACK:          '📨 Intake Log',
-  SETUP:          '✅ Setup Dashboard',
-  GUIDE:          '📖 Guide',
+  SETUP:          '📊 Dashboard',
   KNOWLEDGE_WATCH:'🔍 Knowledge Watch',
-  CONTEXT_REVIEW: '🔎 Context Review',
+  CONTEXT_REVIEW: '🔎 Review',
   TIMELINE:       '📅 Task Timeline',
-  REJECTED_SIGNALS:'🪵 Rejected Signals',
   PEOPLE:         '👥 Stakeholders',
-  SELF_DRIFT:     '🪞 Self Drift',
 };
 
 const LEGACY_SHEET = {
+  COMPANY_PROFILE: '🎯 Company Profile',
+  SETUP: '✅ Setup Dashboard',
+  CONTEXT_REVIEW: '🔎 Context Review',
+  SELF_DRIFT: '🪞 Self Drift',
+  REJECTED_SIGNALS: '🪵 Rejected Signals',
   SLACK: '💬 Slack Inbox',
 };
 
-// Company Profile columns (1-indexed)
+// Goals columns (1-indexed)
 const PROFILE_COL = {
   ID:           1,
   CATEGORY:     2,
@@ -73,15 +77,16 @@ const COL = {
   ID:             1,
   TYPE:           2,
   SOURCE:         3,
-  SUMMARY:        4,
-  CONFIDENCE:     5,
-  LINKED_INTENT:  6,
-  VISIBILITY:     7,
-  ACTION_READY:   8,
+  ORIGIN_REF:     4,
+  SUMMARY:        5,
+  CONFIDENCE:     6,
+  LINKED_INTENT:  7,
+  VISIBILITY:     8,
   TASK_STATUS:    9,
-  CREATED_AT:     10,
-  DETAILS:        11,
-  STAKEHOLDER_IDS:12,
+  DISPOSITION_REASON: 10,
+  CREATED_AT:     11,
+  DETAILS:        12,
+  STAKEHOLDER_IDS:13,
 };
 
 // Knowledge Watch columns (1-indexed)
@@ -109,9 +114,11 @@ const TASK_COL = {
   NOTES:          9,
   OWNER:          10,
   OWNER_CHANNEL:  11,
-  DUE_DATE:       12,
-  UPDATED_AT:     13,
-  STAKEHOLDER_IDS:14,
+  START_DATE:     12,
+  DUE_DATE:       13,
+  BLOCKED_BY:     14,
+  UPDATED_AT:     15,
+  STAKEHOLDER_IDS:16,
 };
 
 const SLACK_INBOX_HEADERS = [
@@ -126,16 +133,16 @@ const SLACK_INBOX_HEADERS = [
 function runAll() {
   const config = validateConfig_(['SPREADSHEET_ID', 'ANTHROPIC_KEY']);
 
-  // Warn if Company Profile has not been filled in.
+  // Warn if Goals have not been filled in.
   // Agents will still run — but output quality degrades without a north star.
   try {
     const ss           = SpreadsheetApp.openById(config.SPREADSHEET_ID);
-    const profileSheet = ss.getSheetByName(SHEET.COMPANY_PROFILE);
+    const profileSheet = getGoalsSheet_(ss);
     if (profileSheet) {
       const profile = readCompanyProfile_(profileSheet);
       if (!profileIsConfigured_(profile)) {
-        Logger.log('⚠  WARNING: Company Profile (North Star) is not configured.');
-        Logger.log('   Open the 🎯 Company Profile tab and replace the placeholder rows before running agents.');
+        Logger.log('⚠  WARNING: Goals (North Star) are not configured.');
+        Logger.log('   Open the 🎯 Goals tab and replace the placeholder rows before running agents.');
         Logger.log('   Planning Lead will run but cannot filter distractions or flag drift without active Goals.');
         Logger.log('   Run showSetupChecklist() for step-by-step guidance.');
         Logger.log('');
@@ -806,12 +813,13 @@ function buildContextRow_(event) {
     event.id,          // ID
     event.type,        // Type
     event.source,      // Source
+    event.originRef || event.ref || '', // Origin Ref
     event.summary,     // Summary
     event.confidence,  // Confidence
-    '',                // Linked Intent (filled manually or by Planning Lead)
+    '',                // Linked Goal (filled manually or by Planning Lead)
     'Team',            // Visibility
-    'No',              // Action Ready
-    '—',               // Task Status
+    'New',             // Planning Status
+    '',                // Disposition Reason
     now,               // Created At
     event.details,     // Details
     '',                // Stakeholder IDs
@@ -821,23 +829,54 @@ function buildContextRow_(event) {
 function ensureContextSheetSchema_(sheet) {
   if (!sheet) return null;
   const requiredHeaders = [
-    'ID', 'Type', 'Source', 'Summary', 'Confidence', 'Linked Intent', 'Visibility',
-    'Action Ready', 'Task Status', 'Created At', 'Details', 'Stakeholder IDs'
+    'ID', 'Type', 'Source', 'Origin Ref', 'Summary', 'Confidence', 'Linked Goal', 'Visibility',
+    'Planning Status', 'Disposition Reason', 'Created At', 'Details', 'Stakeholder IDs'
   ];
-  const currentHeaders = sheet.getRange(1, 1, 1, Math.max(sheet.getLastColumn(), 1)).getValues()[0];
-  let changed = false;
+  const lastRow = Math.max(sheet.getLastRow(), 1);
+  const lastColumn = Math.max(sheet.getLastColumn(), 1);
+  const data = sheet.getRange(1, 1, lastRow, lastColumn).getValues();
+  const currentHeaders = data[0] || [];
+  const currentSignature = currentHeaders.slice(0, requiredHeaders.length).join('|');
+  const requiredSignature = requiredHeaders.join('|');
 
-  requiredHeaders.forEach(function(header, index) {
-    if (currentHeaders[index] !== header) {
-      sheet.getRange(1, index + 1).setValue(header);
-      changed = true;
+  if (currentSignature !== requiredSignature) {
+    const headerIndex = {};
+    currentHeaders.forEach(function(header, index) {
+      headerIndex[String(header || '').trim()] = index;
+    });
+
+    const legacyAliases = {
+      'Linked Goal': ['Linked Goal', 'Linked Intent'],
+      'Planning Status': ['Planning Status', 'Task Status'],
+      'Disposition Reason': ['Disposition Reason'],
+      'Origin Ref': ['Origin Ref'],
+    };
+
+    const migratedRows = [];
+    for (let rowIndex = 1; rowIndex < data.length; rowIndex++) {
+      const row = data[rowIndex];
+      if (!row[0]) continue;
+      migratedRows.push(requiredHeaders.map(function(header) {
+        const aliases = legacyAliases[header] || [header];
+        for (let i = 0; i < aliases.length; i++) {
+          const idx = headerIndex[aliases[i]];
+          if (idx !== undefined) return row[idx];
+        }
+        return '';
+      }));
     }
-  });
 
-  if (changed) {
-    sheet.setColumnWidth(12, 140);
-    sheet.setFrozenRows(1);
+    sheet.clearContents();
+    sheet.getRange(1, 1, 1, requiredHeaders.length).setValues([requiredHeaders]);
+    if (migratedRows.length > 0) {
+      sheet.getRange(2, 1, migratedRows.length, requiredHeaders.length).setValues(migratedRows);
+    }
   }
+
+  sheet.setColumnWidth(4, 180);
+  sheet.setColumnWidth(10, 220);
+  sheet.setColumnWidth(13, 140);
+  sheet.setFrozenRows(1);
 
   return sheet;
 }
@@ -891,7 +930,7 @@ function runPlanningLead() {
   const ss = SpreadsheetApp.openById(config.SPREADSHEET_ID);
   const contextSheet  = ss.getSheetByName(SHEET.CONTEXT);
   const taskSheet     = ss.getSheetByName(SHEET.TASKS);
-  const profileSheet  = ss.getSheetByName(SHEET.COMPANY_PROFILE);
+  const profileSheet  = getGoalsSheet_(ss);
   const peopleSheet   = ss.getSheetByName(SHEET.PEOPLE);
 
   if (!contextSheet || !taskSheet) {
@@ -965,10 +1004,13 @@ function readContextStore_(sheet) {
       source:        row[COL.SOURCE - 1],
       summary:       row[COL.SUMMARY - 1],
       confidence:    row[COL.CONFIDENCE - 1],
+      originRef:     row[COL.ORIGIN_REF - 1],
+      linkedGoal:    row[COL.LINKED_INTENT - 1],
       linkedIntent:  row[COL.LINKED_INTENT - 1],
       visibility:    row[COL.VISIBILITY - 1],
-      actionReady:   row[COL.ACTION_READY - 1],
+      planningStatus:row[COL.TASK_STATUS - 1],
       taskStatus:    row[COL.TASK_STATUS - 1],
+      dispositionReason: row[COL.DISPOSITION_REASON - 1],
       createdAt:     row[COL.CREATED_AT - 1],
       details:       row[COL.DETAILS - 1],
       stakeholderIds:row[COL.STAKEHOLDER_IDS - 1],
@@ -1230,8 +1272,11 @@ function appendTaskRow_(sheet, task) {
     autoNotes,
     task.owner || '',
     task.ownerChannel || '',
+    task.startDate || '',
     task.dueDate || '',
+    task.blockedBy || '',
     now,
+    task.stakeholderIds || '',
   ]);
 }
 
@@ -1302,11 +1347,10 @@ function runBriefingLead() {
   const ss = SpreadsheetApp.openById(config.SPREADSHEET_ID);
   const contextSheet  = ss.getSheetByName(SHEET.CONTEXT);
   const taskSheet     = ss.getSheetByName(SHEET.TASKS);
-  const profileSheet  = ss.getSheetByName(SHEET.COMPANY_PROFILE);
+  const profileSheet  = getGoalsSheet_(ss);
   const peopleSheet   = ss.getSheetByName(SHEET.PEOPLE);
-  const briefSheet    = ensureBriefingsSheet_(ss);
 
-  if (!contextSheet || !taskSheet || !briefSheet) {
+  if (!contextSheet || !taskSheet) {
     Logger.log('ERROR: Required sheets not found for Briefing Lead.');
     return;
   }
@@ -1330,13 +1374,13 @@ function runBriefingLead() {
   const taskSummary    = 'Pending ' + statusCounts['Pending Review'] + ', Approved ' + statusCounts.Approved + ', In Progress ' + statusCounts['In Progress'] + ', Done ' + statusCounts.Done + ', Rejected ' + statusCounts.Rejected;
 
   // Get previous briefing for "what changed" context
-  const prevBriefData = briefSheet.getDataRange().getValues();
-  const lastBriefing  = prevBriefData.length > 1 ? prevBriefData[prevBriefData.length - 1] : null;
+  const lastBriefing  = getLastBriefingRecord_(ss);
 
   const narrative = generateBriefingNarrative_(contextRows, taskRows, profile, stakeholderMap, lastBriefing, config);
-
-  briefSheet.appendRow([now, 'Current', contextSummary, taskSummary, narrative, 'Generated by Briefing Lead']);
-  Logger.log('Briefing Lead: BLUF briefing appended.');
+  const record = [now, 'Current', contextSummary, taskSummary, narrative, 'Generated by Briefing Lead'];
+  storeBriefingRecord_(ss, record);
+  const sent = deliverBriefing_(config, narrative);
+  Logger.log('Briefing Lead: BLUF briefing generated.' + (sent ? ' Delivered to ' + sent + ' channel(s).' : ''));
 }
 
 function generateBriefingNarrative_(contextRows, taskRows, profile, stakeholderMap, lastBriefing, config) {
@@ -1401,7 +1445,7 @@ DECISIONS REQUIRED: [Choices the owner must make. Name the decision explicitly a
 
 EXECUTION RISK: [What is at risk of slipping, failing, or creating a downstream problem. Name the specific task or intent. Not categories — specifics. If none, write "None."]
 
-NORTH STAR ALIGNMENT: [Are active intents and in-progress tasks traceable to the company's annual goals? Call out any work that cannot be traced to a goal, or any active work that looks like an Anti-Goal violation. If everything is aligned, write "Aligned." If no company profile is set, write "No company profile configured."]
+NORTH STAR ALIGNMENT: [Are active intents and in-progress tasks traceable to the active goals? Call out any work that cannot be traced to a goal, or any active work that looks like an Anti-Goal violation. If everything is aligned, write "Aligned." If no goals are set, write "No goals configured."]
 
 OWNER ACTIONS: [Max 3 actions only the owner can take. Numbered. One line each. If none, write "None."]${northStar ? '\n\nCOMPANY NORTH STAR:\n' + northStar : ''}
 
@@ -1463,11 +1507,11 @@ function runResearchAnalyst() {
   Logger.log('=== Research Analyst started ===');
   const config = validateConfig_(['SPREADSHEET_ID', 'ANTHROPIC_KEY']);
   const ss = SpreadsheetApp.openById(config.SPREADSHEET_ID);
-  const watchSheet = ss.getSheetByName(SHEET.KNOWLEDGE_WATCH);
+  const watchStore = getKnowledgeWatchStore_(ss);
   const contextSheet = ss.getSheetByName(SHEET.CONTEXT);
 
-  if (!watchSheet) {
-    Logger.log('Research Analyst: Knowledge Watch tab not found. Run setup to create it.');
+  if (!watchStore) {
+    Logger.log('Research Analyst: Knowledge Watch store not found. Run setup or refresh Dashboard to create it.');
     return;
   }
   if (!contextSheet) {
@@ -1475,9 +1519,9 @@ function runResearchAnalyst() {
     return;
   }
 
-  const watchRows = readKnowledgeWatchRows_(watchSheet);
+  const watchRows = readKnowledgeWatchRows_(watchStore);
   if (watchRows.length === 0) {
-    Logger.log('Research Analyst: No sources in Knowledge Watch tab.');
+    Logger.log('Research Analyst: No sources in Knowledge Watch.');
     return;
   }
 
@@ -1501,15 +1545,15 @@ function runResearchAnalyst() {
       const newHash = simpleHash_(content);
       if (newHash === row.contentHash) {
         Logger.log('Research Analyst: no change detected for ' + row.url + ' — skipping.');
-        updateKnowledgeWatchRow_(watchSheet, index + 2, 'OK (unchanged)', new Date().toISOString(), newHash);
+        updateKnowledgeWatchRow_(watchStore, row.rowNum, 'OK (unchanged)', new Date().toISOString(), newHash);
         return;
       }
 
       fetched.push({ source: row.url, tags: row.tags, content: content });
-      updateKnowledgeWatchRow_(watchSheet, index + 2, 'OK', new Date().toISOString(), newHash);
+      updateKnowledgeWatchRow_(watchStore, row.rowNum, 'OK', new Date().toISOString(), newHash);
     } catch (e) {
       Logger.log('Research Analyst: failed to fetch ' + row.url + ': ' + e.message);
-      updateKnowledgeWatchRow_(watchSheet, index + 2, 'Error', '', '');
+      updateKnowledgeWatchRow_(watchStore, row.rowNum, 'Error', '', '');
     }
   });
 
@@ -1526,8 +1570,8 @@ function runResearchAnalyst() {
     const id = 'learn-ra-' + simpleHash_(learning.summary);
     if (existingIds.has(id)) return;
     appendContextRow_(contextSheet, [
-      id, 'Learning', 'Research Analyst', learning.summary,
-      'Medium', learning.linkedIntent || '', 'Team', 'No', '—',
+      id, 'Learning', 'Research Analyst', '',
+      learning.summary, 'Medium', learning.linkedIntent || '', 'Team', 'Used', '',
       new Date().toISOString(), learning.details || '', '',
     ]);
     existingIds.add(id);
@@ -1539,13 +1583,17 @@ function runResearchAnalyst() {
 
 // --- Knowledge Watch helpers ---
 
-function readKnowledgeWatchRows_(sheet) {
-  const data = sheet.getDataRange().getValues();
+function readKnowledgeWatchRows_(store) {
+  const sheet = store.sheet;
+  const data = store.mode === 'dashboard'
+    ? sheet.getRange(2, 6, Math.max(sheet.getLastRow() - 1, 1), 8).getValues()
+    : sheet.getDataRange().getValues();
   const rows = [];
   for (let i = 1; i < data.length; i++) {
     const row = data[i];
     if (!row[WATCH_COL.URL - 1]) continue;
     rows.push({
+      rowNum: store.mode === 'dashboard' ? i + 2 : i + 1,
       url:         String(row[WATCH_COL.URL - 1]          || '').trim(),
       type:        String(row[WATCH_COL.TYPE - 1]         || 'Web').trim(),
       tags:        String(row[WATCH_COL.TOPIC_TAGS - 1]   || '').trim(),
@@ -1557,11 +1605,13 @@ function readKnowledgeWatchRows_(sheet) {
   return rows;
 }
 
-function updateKnowledgeWatchRow_(sheet, rowNum, status, lastFetched, contentHash) {
-  sheet.getRange(rowNum, WATCH_COL.LAST_FETCHED).setValue(lastFetched);
-  sheet.getRange(rowNum, WATCH_COL.STATUS).setValue(status);
+function updateKnowledgeWatchRow_(store, rowNum, status, lastFetched, contentHash) {
+  const sheet = store.sheet;
+  const offset = store.mode === 'dashboard' ? 5 : 0;
+  sheet.getRange(rowNum, WATCH_COL.LAST_FETCHED + offset).setValue(lastFetched);
+  sheet.getRange(rowNum, WATCH_COL.STATUS + offset).setValue(status);
   if (contentHash !== undefined) {
-    sheet.getRange(rowNum, WATCH_COL.CONTENT_HASH).setValue(contentHash);
+    sheet.getRange(rowNum, WATCH_COL.CONTENT_HASH + offset).setValue(contentHash);
   }
 }
 
@@ -1706,7 +1756,7 @@ function readCompanyProfile_(sheet) {
 // Builds a compact north star block for use in agent prompts.
 // Capped at ~500 chars to avoid ballooning token cost in every call.
 function buildNorthStarContext_(profile) {
-  if (!profile) return '(no company profile — add goals to the Company Profile tab)';
+  if (!profile) return '(no goals configured — add goals to the Goals tab)';
 
   const lines = [];
   if (profile.mission)                lines.push('Mission: ' + profile.mission);
@@ -1730,7 +1780,7 @@ function buildNorthStarContext_(profile) {
   return full.length > 600 ? full.substring(0, 597) + '...' : full;
 }
 
-// Returns true if the company profile has been meaningfully filled in
+// Returns true if the goals sheet has been meaningfully filled in
 function profileIsConfigured_(profile) {
   return profile && (profile.annualGoals.length > 0 || profile.mission !== '');
 }
@@ -1796,41 +1846,24 @@ function runEditorialDirector() {
   const briefSheet    = ss.getSheetByName(SHEET.BRIEFINGS);
   const contextSheet  = ss.getSheetByName(SHEET.CONTEXT);
   const taskSheet     = ss.getSheetByName(SHEET.TASKS);
-
-  if (!briefSheet) {
-    Logger.log('Editorial Director: Briefings sheet not found.');
+  const briefing = getLastBriefingRecord_(ss);
+  if (!briefing) {
+    Logger.log('Editorial Director: No briefing record available.');
     return;
   }
-
-  const briefData = briefSheet.getDataRange().getValues();
-  if (briefData.length <= 1) {
-    Logger.log('Editorial Director: No briefings to review.');
-    return;
-  }
-
-  // Find the latest briefing that has not been reviewed yet
-  let targetRow = -1;
-  for (let i = briefData.length - 1; i >= 1; i--) {
-    const notes = String(briefData[i][5] || '');
-    if (!notes.includes('[Editorial Director]')) {
-      targetRow = i;
-      break;
-    }
-  }
-
-  if (targetRow === -1) {
-    Logger.log('Editorial Director: All briefings already reviewed.');
-    return;
-  }
-
-  const briefing     = briefData[targetRow];
   const contextRows  = contextSheet ? readContextStore_(contextSheet) : [];
   const taskRows     = taskSheet    ? readTaskStore_(taskSheet)       : [];
   const review       = reviewBriefingContent_(briefing, contextRows, taskRows, config);
-
-  const notesCell    = briefSheet.getRange(targetRow + 1, 6);
   const currentNotes = String(briefing[5] || '');
-  notesCell.setValue(currentNotes ? currentNotes + ' | ' + review : review);
+  briefing[5] = currentNotes ? currentNotes + ' | ' + review : review;
+  storeBriefingRecord_(ss, briefing, { skipSheetAppend: true });
+  if (briefSheet) {
+    const briefData = briefSheet.getDataRange().getValues();
+    const targetRow = briefData.length > 1 ? briefData.length : -1;
+    if (targetRow > 1) {
+      briefSheet.getRange(targetRow, 6).setValue(briefing[5]);
+    }
+  }
 
   Logger.log('Editorial Director: Briefing reviewed and annotated.');
 }
@@ -1889,8 +1922,8 @@ function runKnowledgeManager() {
   const config = validateConfig_(['SPREADSHEET_ID', 'ANTHROPIC_KEY']);
   const ss = SpreadsheetApp.openById(config.SPREADSHEET_ID);
   const contextSheet  = ss.getSheetByName(SHEET.CONTEXT);
-  const profileSheet  = ss.getSheetByName(SHEET.COMPANY_PROFILE);
-  const reviewSheet   = ensureContextReviewSheet_(ss);
+  const profileSheet  = getGoalsSheet_(ss);
+  const reviewSheet   = ensureReviewSheet_(ss);
 
   if (!contextSheet) {
     Logger.log('Knowledge Manager: Context Store not found.');
@@ -1957,11 +1990,10 @@ function runKnowledgeManager() {
 
   reviewSheet.appendRow([
     new Date().toISOString(),
-    contextRows.length,
-    stale.length,
-    duplicates.length,
-    orphaned.length,
-    lowConfOld.length,
+    'Context Hygiene',
+    'All context',
+    totalIssues > 0 ? 'Watch' : 'Healthy',
+    auditText,
     recommendations,
     '',
   ]);
@@ -2001,27 +2033,31 @@ If no issues were found, confirm the store looks healthy.`;
   }
 }
 
-function ensureContextReviewSheet_(ss) {
-  let sheet = ss.getSheetByName(SHEET.CONTEXT_REVIEW);
-  if (sheet) return sheet;
+function ensureReviewSheet_(ss) {
+  let sheet = getSheetByConfiguredName_(ss, SHEET.CONTEXT_REVIEW, [LEGACY_SHEET.CONTEXT_REVIEW, LEGACY_SHEET.SELF_DRIFT]);
+  if (sheet) {
+    const headers = ['Reviewed At', 'Review Type', 'Window', 'Status', 'Findings', 'Recommendation', 'Notes'];
+    sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+    sheet.setFrozenRows(1);
+    return sheet;
+  }
 
   sheet = ss.insertSheet(SHEET.CONTEXT_REVIEW);
-  sheet.appendRow(['Reviewed At', 'Total Rows', 'Stale', 'Duplicates', 'Orphaned', 'Low Conf Old', 'Recommendations', 'Notes']);
+  sheet.appendRow(['Reviewed At', 'Review Type', 'Window', 'Status', 'Findings', 'Recommendation', 'Notes']);
 
-  const headerRange = sheet.getRange(1, 1, 1, 8);
+  const headerRange = sheet.getRange(1, 1, 1, 7);
   headerRange.setBackground('#2d3748');
   headerRange.setFontColor('#ffffff');
   headerRange.setFontWeight('bold');
   headerRange.setFontSize(10);
 
   sheet.setColumnWidth(1, 170);
-  sheet.setColumnWidth(2, 90);
-  sheet.setColumnWidth(3, 70);
-  sheet.setColumnWidth(4, 90);
-  sheet.setColumnWidth(5, 90);
-  sheet.setColumnWidth(6, 110);
-  sheet.setColumnWidth(7, 420);
-  sheet.setColumnWidth(8, 200);
+  sheet.setColumnWidth(2, 140);
+  sheet.setColumnWidth(3, 120);
+  sheet.setColumnWidth(4, 120);
+  sheet.setColumnWidth(5, 420);
+  sheet.setColumnWidth(6, 360);
+  sheet.setColumnWidth(7, 220);
   sheet.setFrozenRows(1);
   return sheet;
 }
@@ -2156,25 +2192,18 @@ Write one sharp sentence (max 160 chars) naming the single most important action
   }
 }
 
-function ensureRejectedSignalsSheet_(ss) {
-  let sheet = ss.getSheetByName(SHEET.REJECTED_SIGNALS);
-  if (sheet) return sheet;
-
-  sheet = ss.insertSheet(SHEET.REJECTED_SIGNALS);
-  sheet.appendRow(['Logged At', 'Signal ID', 'Summary', 'Confidence', 'Reason', 'Next Review', 'Notes']);
-  sheet.setFrozenRows(1);
-  return sheet;
-}
-
 function logRejectedSignals_(config, rankedSignals, proposals) {
   if (!rankedSignals || rankedSignals.length === 0) return;
 
   const ss = SpreadsheetApp.openById(config.SPREADSHEET_ID);
-  const sheet = ensureRejectedSignalsSheet_(ss);
-  const existingKeys = new Set();
+  const sheet = ss.getSheetByName(SHEET.CONTEXT);
+  if (!sheet) return;
+  ensureContextSheetSchema_(sheet);
   const data = sheet.getDataRange().getValues();
+  const rowMap = {};
   for (let i = 1; i < data.length; i++) {
-    existingKeys.add(String(data[i][1] || '') + '|' + String(data[i][4] || ''));
+    const contextId = String(data[i][COL.ID - 1] || '').trim();
+    if (contextId) rowMap[contextId] = i + 1;
   }
 
   const usedContextIds = {};
@@ -2195,18 +2224,10 @@ function logRejectedSignals_(config, rankedSignals, proposals) {
 
   rejectedSignals.forEach(function(signal) {
     const reason = reasonMap[signal.id] || inferRejectedSignalReasonHeuristically_(signal, proposals || []) || baseReason;
-    const key = String(signal.id || '') + '|' + reason;
-    if (existingKeys.has(key)) return;
-    sheet.appendRow([
-      new Date().toISOString(),
-      signal.id || '',
-      signal.summary || '',
-      signal.confidence || '',
-      reason,
-      nextReview,
-      signal.linkedIntent ? 'Linked intent: ' + signal.linkedIntent : '',
-    ]);
-    existingKeys.add(key);
+    const rowNum = rowMap[String(signal.id || '').trim()];
+    if (!rowNum) return;
+    sheet.getRange(rowNum, COL.TASK_STATUS).setValue('Not Now');
+    sheet.getRange(rowNum, COL.DISPOSITION_REASON).setValue(reason + ' Next review: ' + nextReview);
   });
 }
 
@@ -2282,8 +2303,8 @@ function runSelfDriftCheck() {
   const ss = SpreadsheetApp.openById(config.SPREADSHEET_ID);
   const taskSheet = ss.getSheetByName(SHEET.TASKS);
   const contextSheet = ss.getSheetByName(SHEET.CONTEXT);
-  const profileSheet = ss.getSheetByName(SHEET.COMPANY_PROFILE);
-  const driftSheet = ensureSelfDriftSheet_(ss);
+  const profileSheet = getGoalsSheet_(ss);
+  const driftSheet = ensureReviewSheet_(ss);
 
   if (!taskSheet || !contextSheet) {
     Logger.log('Self Drift Check: required sheets not found.');
@@ -2292,7 +2313,7 @@ function runSelfDriftCheck() {
 
   const profile = readCompanyProfile_(profileSheet);
   if (!profileIsConfigured_(profile)) {
-    Logger.log('Self Drift Check: company profile not configured.');
+    Logger.log('Self Drift Check: goals are not configured.');
     return;
   }
 
@@ -2351,6 +2372,7 @@ Rules:
     const parsed = parseClaudeJsonObject_(response) || {};
     driftSheet.appendRow([
       new Date().toISOString(),
+      'Self Drift',
       'Last 7 days',
       String(parsed.alignmentStatus || 'Watch'),
       String(parsed.driftSignals || ''),
@@ -2363,16 +2385,6 @@ Rules:
   }
 }
 
-function ensureSelfDriftSheet_(ss) {
-  let sheet = ss.getSheetByName(SHEET.SELF_DRIFT);
-  if (sheet) return sheet;
-
-  sheet = ss.insertSheet(SHEET.SELF_DRIFT);
-  sheet.appendRow(['Reviewed At', 'Window', 'Alignment Status', 'Drift Signals', 'Correction', 'Notes']);
-  sheet.setFrozenRows(1);
-  return sheet;
-}
-
 function buildSelfDriftCacheKey_(profile, tasks, signals) {
   return 'selfdrift:' + simpleHash_([
     buildNorthStarContext_(profile),
@@ -2382,8 +2394,8 @@ function buildSelfDriftCacheKey_(profile, tasks, signals) {
 }
 
 // ============================================================
-// SLACK RELAY
-// Accept requests from a trusted relay rather than Slack directly.
+// CHANNEL RELAY
+// Accept requests from a trusted relay rather than directly from the messaging platform.
 // ============================================================
 
 function handleRelayRequest_(payload) {
@@ -2791,12 +2803,13 @@ function buildChannelContextRow_(item) {
     item.id,
     item.type || 'Signal',
     item.source || 'Signal',
+    item.originRef || '',
     item.summary,
     item.confidence || 'Medium',
     '',
     'Team',
-    'No',
-    '—',
+    item.planningStatus || 'New',
+    item.dispositionReason || '',
     now,
     item.details,
     item.stakeholderIds || '',
@@ -2804,11 +2817,11 @@ function buildChannelContextRow_(item) {
 }
 
 function buildConversationContextRows_(prompt, reply, metadata, extracted) {
-  if (!extracted || !Array.isArray(extracted.items) || extracted.items.length === 0) {
+  if (!extracted || !Array.isArray(extracted.items)) {
     return [];
   }
 
-  return extracted.items
+  const rows = extracted.items
     .filter(function(item) { return item && item.type && item.type !== 'None'; })
     .map(function(item, index) {
       const normalizedType = normalizeContextType_(item.type);
@@ -2831,6 +2844,20 @@ function buildConversationContextRows_(prompt, reply, metadata, extracted) {
         confidence: normalizeConfidence_(item.confidence),
       });
     });
+
+  if (extracted.summary) {
+    rows.push(buildChannelContextRow_({
+      id: buildConversationContextId_(metadata, 'Intake', extracted.summary, 999),
+      source: metadata.source || metadata.platform || 'Channel',
+      originRef: buildConversationOriginRef_(metadata),
+      summary: extracted.summary,
+      details: 'Promoted intake summary from channel conversation.',
+      type: 'Intake',
+      confidence: 'Medium',
+    }));
+  }
+
+  return rows;
 }
 
 function buildConversationContextId_(metadata, type, summary, index) {
@@ -2847,6 +2874,7 @@ function buildConversationContextId_(metadata, type, summary, index) {
 
 function normalizeContextType_(value) {
   const raw = String(value || 'Signal').trim().toLowerCase();
+  if (raw === 'intake') return 'Intake';
   if (raw === 'intent') return 'Intent';
   if (raw === 'decision') return 'Decision';
   if (raw === 'constraint') return 'Constraint';
@@ -2990,6 +3018,14 @@ function buildFallbackConversationSummary_(prompt, metadata) {
   return `${metadata.platform || metadata.source || 'Channel'} context from ${metadata.user || 'teammate'}`;
 }
 
+function buildConversationOriginRef_(metadata) {
+  return [
+    String(metadata.platform || metadata.source || 'channel').toLowerCase(),
+    metadata.channel || 'unknown',
+    metadata.threadId || '',
+  ].filter(Boolean).join(':');
+}
+
 function buildConversationNotes_(extracted, contextIds, artifactRows) {
   const notes = [];
   if (contextIds.length > 0) notes.push('Context IDs: ' + contextIds.join(', '));
@@ -3063,7 +3099,8 @@ function getAllowedWhatsAppSenders_(config) {
 
 function logSlackConversation_(config, item) {
   const ss = SpreadsheetApp.openById(config.SPREADSHEET_ID);
-  const sheet = ensureSlackInboxSheet_(ss);
+  const sheet = ss.getSheetByName(SHEET.SLACK) || ss.getSheetByName(LEGACY_SHEET.SLACK);
+  if (!sheet) return;
   ensureSlackInboxHeaders_(sheet);
   sheet.appendRow([
     new Date().toISOString(),
@@ -3169,6 +3206,7 @@ function postWhatsAppMessage_(config, recipientId, text) {
   parseJsonResponse_(response, 'WhatsApp');
 }
 
+// Optional compatibility archive for teams that still want a sheet copy of briefings.
 function ensureBriefingsSheet_(ss) {
   let sheet = ss.getSheetByName(SHEET.BRIEFINGS);
   if (sheet) return sheet;
@@ -3177,6 +3215,41 @@ function ensureBriefingsSheet_(ss) {
   sheet.appendRow(['Generated At', 'Period', 'Context Summary', 'Task Summary', 'Highlights', 'Notes']);
   sheet.setFrozenRows(1);
   return sheet;
+}
+
+function getLastBriefingRecord_(ss) {
+  const sheet = ss.getSheetByName(SHEET.BRIEFINGS);
+  if (sheet) {
+    const data = sheet.getDataRange().getValues();
+    return data.length > 1 ? data[data.length - 1] : null;
+  }
+
+  const raw = PropertiesService.getScriptProperties().getProperty('LAST_BRIEFING_JSON');
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+function storeBriefingRecord_(ss, record, options) {
+  PropertiesService.getScriptProperties().setProperty('LAST_BRIEFING_JSON', JSON.stringify(record));
+  const sheet = ss.getSheetByName(SHEET.BRIEFINGS);
+  if (sheet && !(options && options.skipSheetAppend)) sheet.appendRow(record);
+}
+
+function deliverBriefing_(config, narrative) {
+  const raw = String(config.BRIEFING_DELIVERY_CHANNELS || '').trim();
+  if (!raw) return 0;
+
+  let sent = 0;
+  const message = 'Chief of Staff Briefing\n\n' + narrative;
+  raw.split(',').map(function(value) { return value.trim(); }).filter(Boolean).forEach(function(channel) {
+    if (sendMessageToOwnerChannel_(config, channel, message)) sent++;
+  });
+  return sent;
 }
 
 // ============================================================
@@ -3323,6 +3396,8 @@ function showSetupChecklist() {
   Logger.log(`WhatsApp allowed senders: ${props.WHATSAPP_ALLOWED_SENDERS || '(optional)'}`);
   Logger.log(`Google write-back spreadsheet: ${props.GOOGLE_WRITEBACK_SPREADSHEET_ID || '(optional)'}`);
   Logger.log(`Google write-back sheet name: ${props.GOOGLE_WRITEBACK_SHEET_NAME || '(optional)'}`);
+  Logger.log(`Briefing delivery channels: ${props.BRIEFING_DELIVERY_CHANNELS || '(optional)'}`);
+  Logger.log(`Gantt Slides deck ID: ${props.GANTT_SLIDES_ID || '(optional)'}`);
 
   if (missing.length === 0) {
     Logger.log('All required script properties are configured.');
@@ -3334,24 +3409,24 @@ function showSetupChecklist() {
   try {
     refreshSetupDashboard();
     Logger.log('');
-    Logger.log('✅ Setup Dashboard refreshed.');
+    Logger.log('✅ Dashboard refreshed.');
   } catch (e) {
-    Logger.log('Setup Dashboard refresh skipped: ' + e.message);
+    Logger.log('Dashboard refresh skipped: ' + e.message);
   }
 
   // ── North Star check ──────────────────────────────────────────
   // Agents run without a north star but produce lower-quality output.
   // This check tells the user exactly what to fill in.
   Logger.log('');
-  Logger.log('── Company Profile (North Star) ──');
+  Logger.log('── Goals (North Star) ──');
   if (!props.SPREADSHEET_ID || String(props.SPREADSHEET_ID).startsWith('YOUR_')) {
     Logger.log('Skipped — SPREADSHEET_ID not set yet.');
   } else {
     try {
       const ss           = SpreadsheetApp.openById(props.SPREADSHEET_ID);
-      const profileSheet = ss.getSheetByName(SHEET.COMPANY_PROFILE);
+      const profileSheet = getGoalsSheet_(ss);
       if (!profileSheet) {
-        Logger.log('NOT FOUND — run setup() first to create the Company Profile tab.');
+        Logger.log('NOT FOUND — run setup() first to create the Goals tab.');
       } else {
         const profile = readCompanyProfile_(profileSheet);
         if (profileIsConfigured_(profile)) {
@@ -3368,13 +3443,13 @@ function showSetupChecklist() {
         } else {
           Logger.log('Status: NOT CONFIGURED ← action required');
           Logger.log('');
-          Logger.log('  The 🎯 Company Profile tab still contains placeholder rows.');
+          Logger.log('  The 🎯 Goals tab still contains placeholder rows.');
           Logger.log('  Until this is filled in:');
           Logger.log('    • Planning Lead cannot filter distractions or flag drift');
           Logger.log('    • Briefing Lead will omit the North Star Alignment section');
           Logger.log('    • Knowledge Manager cannot detect Intent drift');
           Logger.log('');
-          Logger.log('  What to fill in (open the 🎯 Company Profile tab):');
+          Logger.log('  What to fill in (open the 🎯 Goals tab):');
           Logger.log('    1. Mission    — Why you exist and who you serve');
           Logger.log('    2. Vision     — Where you are in 3 years (concrete + directional)');
           Logger.log('    3. Annual Goal — OKR format: Objective + measurable Key Result. Add one row per goal.');
@@ -3396,13 +3471,13 @@ function refreshSetupDashboard() {
   }
 
   const ss = SpreadsheetApp.openById(config.SPREADSHEET_ID);
-  const sheet = ss.getSheetByName(SHEET.SETUP);
+  const sheet = getDashboardSheet_(ss);
 
   if (!sheet) {
-    throw new Error('Setup Dashboard tab not found. Re-run setup() to create it.');
+    throw new Error('Dashboard tab not found. Re-run setup() to create it.');
   }
 
-  const profileSheet = ss.getSheetByName(SHEET.COMPANY_PROFILE);
+  const profileSheet = getGoalsSheet_(ss);
   const profile = profileSheet ? readCompanyProfile_(profileSheet) : null;
   const profileReady = !!profile && profileIsConfigured_(profile);
   const enabledSources = getEnabledSources_(config);
@@ -3425,7 +3500,7 @@ function refreshSetupDashboard() {
 
   const requiredRows = [
     buildStatusRow_('Create the sheet via setup()', !!config.SPREADSHEET_ID && !String(config.SPREADSHEET_ID).startsWith('YOUR_'), 'Now', 'Apps Script editor'),
-    buildStatusRow_('Fill in 🎯 Company Profile', profileReady, 'Now', 'Spreadsheet -> 🎯 Company Profile'),
+    buildStatusRow_('Fill in 🎯 Goals', profileReady, 'Now', 'Spreadsheet -> 🎯 Goals'),
     buildStatusRow_('Add ANTHROPIC_KEY', !!config.ANTHROPIC_KEY && !String(config.ANTHROPIC_KEY).startsWith('YOUR_'), 'Now', 'Apps Script -> Project Settings -> Script properties'),
     buildStatusRow_('Choose at least one source', enabledSources.length > 0, 'Now', 'Script properties -> ENABLED_SOURCES'),
   ];
@@ -3435,18 +3510,20 @@ function refreshSetupDashboard() {
     .concat([
       buildFeatureRow_('Google task write-back', !!config.GOOGLE_WRITEBACK_SPREADSHEET_ID, 'Later', 'Script properties: GOOGLE_WRITEBACK_SPREADSHEET_ID + optional GOOGLE_WRITEBACK_SHEET_NAME'),
       buildFeatureRow_('Smartsheet task write-back', !!config.SMARTSHEET_TASK_SHEET_ID && !!config.SMARTSHEET_TOKEN, 'Later', 'Script properties: SMARTSHEET_TASK_SHEET_ID + SMARTSHEET_TOKEN'),
+      buildFeatureRow_('Briefing delivery', !!config.BRIEFING_DELIVERY_CHANNELS, 'Later', 'Script properties: BRIEFING_DELIVERY_CHANNELS (comma-separated owner channels)'),
+      buildFeatureRow_('Gantt deck', !!config.GANTT_SLIDES_ID, 'Now or later', config.GANTT_SLIDES_ID ? ('Slides deck: https://docs.google.com/presentation/d/' + config.GANTT_SLIDES_ID + '/edit') : 'Run refreshTaskTimeline_() or "refresh timeline" to create it'),
       buildFeatureRow_('Slack channel', slackEnabled, 'Recommended first channel when ready', 'Slack relay + SLACK_BOT_TOKEN + SLACK_RELAY_SECRET'),
       buildFeatureRow_('Telegram channel', telegramEnabled, 'Later', 'Relay deployment + TELEGRAM_BOT_TOKEN'),
       buildFeatureRow_('WhatsApp channel', whatsappEnabled, 'Later', 'Relay deployment + WHATSAPP_TOKEN + WHATSAPP_PHONE_NUMBER_ID'),
       [ 'Office hours triggers', automationReady ? summarizeTriggerStatus_(triggerStatuses) : 'Missing', 'Now', 'Apps Script -> Triggers' ],
-      [ 'Knowledge Watch', knowledgeWatchReady ? 'Configured' : 'Optional', 'After core setup works', 'Spreadsheet -> 🔍 Knowledge Watch' ],
+      [ 'Knowledge Watch', knowledgeWatchReady ? 'Configured' : 'Optional', 'After core setup works', 'Dashboard -> Knowledge Watch section' ],
     ]);
 
   const requiredDone = requiredRows.filter(row => row[1] === 'Ready').length;
   const optionalEnabled = optionalRows.filter(row => row[1] !== 'Optional' && row[1] !== 'Not enabled').length;
 
   const rows = [
-    ['SETUP DASHBOARD', '', '', ''],
+    ['DASHBOARD', '', '', ''],
     ['Last refreshed', new Date().toISOString(), 'Any time', 'Run refreshSetupDashboard() or showSetupChecklist()'],
     ['Overall setup', requiredDone === requiredRows.length ? 'Core ready' : `${requiredDone}/${requiredRows.length} core steps done`, 'Now', 'Complete the remaining Required Now items'],
     ['Optional features enabled', String(optionalEnabled), 'Later', 'Enable only what you want'],
@@ -3455,7 +3532,9 @@ function refreshSetupDashboard() {
   ].concat(requiredRows).concat([
     ['', '', '', ''],
     ['OPTIONAL LATER', '', '', ''],
-  ]).concat(optionalRows);
+  ]).concat(optionalRows).concat([
+    ['', '', '', ''],
+  ]).concat(typeof buildSetupGuideRows_ === 'function' ? buildSetupGuideRows_() : []);
 
   sheet.clearContents();
   sheet.getRange(1, 1, 1, 4).setValues([['Item', 'Status', 'When To Set Up', 'Where To Set It Up']]);
@@ -3467,19 +3546,27 @@ function refreshSetupDashboard() {
 
   sheet.getRange(2, 1, rows.length, 4).setValues(rows);
   sheet.getRange(2, 1, rows.length, 4).setFontSize(10).setVerticalAlignment('top').setWrap(true);
+  if (typeof styleDashboardRows_ === 'function') {
+    styleDashboardRows_(sheet, rows);
+  } else if (typeof styleSetupDashboardRows_ === 'function') {
+    styleSetupDashboardRows_(sheet, rows);
+  } else {
+    for (let r = 2; r <= rows.length + 1; r++) {
+      const label = sheet.getRange(r, 1).getValue();
+      const range = sheet.getRange(r, 1, 1, 4);
 
-  for (let r = 2; r <= rows.length + 1; r++) {
-    const label = sheet.getRange(r, 1).getValue();
-    const range = sheet.getRange(r, 1, 1, 4);
-
-    if (label === 'SETUP DASHBOARD' || label === 'REQUIRED NOW' || label === 'OPTIONAL LATER') {
-      range.setBackground('#eef4fb');
-      sheet.getRange(r, 1).setFontWeight('bold').setFontColor('#17324d');
-    } else if (label === '') {
-      range.setBackground('#ffffff');
-    } else {
-      range.setBackground(r % 2 === 0 ? '#f9fbfd' : '#ffffff');
+      if (label === 'DASHBOARD' || label === 'REQUIRED NOW' || label === 'OPTIONAL LATER') {
+        range.setBackground('#eef4fb');
+        sheet.getRange(r, 1).setFontWeight('bold').setFontColor('#17324d');
+      } else if (label === '') {
+        range.setBackground('#ffffff');
+      } else {
+        range.setBackground(r % 2 === 0 ? '#f9fbfd' : '#ffffff');
+      }
     }
+  }
+  if (typeof buildDashboardKnowledgeWatchArea_ === 'function') {
+    buildDashboardKnowledgeWatchArea_(sheet);
   }
 }
 
@@ -3517,14 +3604,48 @@ function summarizeTriggerStatus_(statuses) {
 }
 
 function getKnowledgeWatchStatus_(ss) {
-  const sheet = ss.getSheetByName(SHEET.KNOWLEDGE_WATCH);
-  if (!sheet) return false;
+  const store = getKnowledgeWatchStore_(ss);
+  if (!store) return false;
 
-  const lastRow = sheet.getLastRow();
-  if (lastRow < 2) return false;
+  const sheet = store.sheet;
+  const values = store.mode === 'dashboard'
+    ? sheet.getRange(3, 6, Math.max(sheet.getLastRow() - 2, 1), 6).getValues()
+    : sheet.getRange(2, 1, Math.max(sheet.getLastRow() - 1, 1), 6).getValues();
+  return values.some(function(row) {
+    return row[0] && String(row[5] || '').toLowerCase() === 'active';
+  });
+}
 
-  const values = sheet.getRange(2, 1, lastRow - 1, 6).getValues();
-  return values.some(row => row[0] && String(row[5] || '').toLowerCase() === 'active');
+function getSheetByConfiguredName_(ss, primaryName, legacyNames) {
+  const candidates = [primaryName].concat(legacyNames || []);
+  for (let i = 0; i < candidates.length; i++) {
+    const candidate = candidates[i];
+    if (!candidate) continue;
+    const sheet = ss.getSheetByName(candidate);
+    if (sheet) return sheet;
+  }
+  return null;
+}
+
+function getGoalsSheet_(ss) {
+  return getSheetByConfiguredName_(ss, SHEET.COMPANY_PROFILE, [LEGACY_SHEET.COMPANY_PROFILE]);
+}
+
+function getDashboardSheet_(ss) {
+  return getSheetByConfiguredName_(ss, SHEET.SETUP, [LEGACY_SHEET.SETUP]);
+}
+
+function getKnowledgeWatchStore_(ss) {
+  const dedicated = ss.getSheetByName(SHEET.KNOWLEDGE_WATCH);
+  if (dedicated) return { mode: 'sheet', sheet: dedicated };
+
+  const dashboard = getDashboardSheet_(ss);
+  if (!dashboard) return null;
+  const title = String(dashboard.getRange(1, 6).getValue() || '').trim();
+  if (title === 'KNOWLEDGE WATCH') {
+    return { mode: 'dashboard', sheet: dashboard };
+  }
+  return null;
 }
 
 function setFrameworkConfig() {
@@ -3556,6 +3677,8 @@ function setFrameworkConfig() {
     WHATSAPP_ALLOWED_SENDERS: '',
     GOOGLE_WRITEBACK_SPREADSHEET_ID: '',
     GOOGLE_WRITEBACK_SHEET_NAME: 'Chief of Staff Tasks',
+    BRIEFING_DELIVERY_CHANNELS: '',
+    GANTT_SLIDES_ID: '',
   });
 
   Logger.log('Template values saved to Script properties.');
@@ -3594,6 +3717,8 @@ function getConfig_() {
     WHATSAPP_ALLOWED_SENDERS: props[CONFIG_KEYS.WHATSAPP_ALLOWED_SENDERS] || '',
     GOOGLE_WRITEBACK_SPREADSHEET_ID: props[CONFIG_KEYS.GOOGLE_WRITEBACK_SPREADSHEET_ID] || '',
     GOOGLE_WRITEBACK_SHEET_NAME: props[CONFIG_KEYS.GOOGLE_WRITEBACK_SHEET_NAME] || 'Chief of Staff Tasks',
+    BRIEFING_DELIVERY_CHANNELS: props[CONFIG_KEYS.BRIEFING_DELIVERY_CHANNELS] || '',
+    GANTT_SLIDES_ID: props[CONFIG_KEYS.GANTT_SLIDES_ID] || '',
   };
 }
 

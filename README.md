@@ -6,9 +6,9 @@ This is a team of agents, led by a Chief of Staff ([Feature list](https://www.no
 
 - You can communicate with your Chief of Staff via Slack*, Telegram*, and/or WhatsApp. You can also forward emails to them.
 - You can send them your goals, thoughts, meeting notes, and docs. They can also gather context from Google Drive*, Notion*, Smartsheet*, and OneDrive*.
-- They collects context from across your work, store it in one place (Google Sheets — source of truth). That’s where they work from.
-- With all of these information, the Chief of Staff and their team propose work, flag drift, and generate updates on Google Sheets — based on your goals and north star.
-  - Optionally it can create tasks on SmartSheet — approve, update, assign, reassign, add notes, set due dates (and send reminders).
+- They collect context from across your work and store it in one place: Google Sheets, which stays the source of truth.
+- With all of this information, the Chief of Staff and their team propose work, flag drift, keep a single Google Slides Gantt deck current, and generate updates based on your goals and north star.
+  - Optionally it can sync task updates to Smartsheet while Google Sheets remains the source of truth.
 - You can assign work to them, and they will create/update Google Docs.
 
 ## Org chart
@@ -36,7 +36,7 @@ You
 ## Operating Principles
 
 - Shared memory first: everything is recorded into the Google Sheet context store. You can see exactly what the team did and why.
-- North Star alignment: the `🎯 Company Profile` gives the team mission, goals, anti-goals, and principles so it can filter distractions.
+- North Star alignment: the `🎯 Goals` tab gives the team mission, goals, anti-goals, and principles so it can filter distractions.
 - Goals over signals — every task gets tested before it reaches you.
 
 ## Meet the team
